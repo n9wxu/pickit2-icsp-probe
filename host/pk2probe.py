@@ -726,7 +726,6 @@ def cmd_program(p, args):
         d = t.device
         print(describe(t))
         flash, cfg, ee = split_image(d, words)
-        # Unimplemented configuration bits read as 1 whatever is written.
         t0 = time.time()
         t.bulk_erase()
         top = max((a for a, w in enumerate(flash) if w != BLANK), default=-1) + 1
@@ -744,7 +743,6 @@ def cmd_program(p, args):
             t.write_config_space(conf)
             lo = min(conf)
             back = t.read_words(lo, max(conf) - lo + 1)
-            impl = getattr(args, 'config_mask', None)
             for a, w in sorted(conf.items()):
                 if back[a - lo] != w:
                     errors.append('config %04X: wrote %04X, read %04X' % (a, w, back[a - lo]))
