@@ -147,15 +147,14 @@ pic16f1-lldb prog.elf -o "gdb-remote 3333"
 
 What worked: connecting, the register display including the compiler's pairs, disassembly, breakpoints by function
 name and by source line, `continue`, `stepi`, `bt` through inlined frames and a library routine, `frame variable`,
-`target variable`. Run to the last line, `total` read 83, the value the program is written to end with.
+`target variable`, expressions (`p gain + gain + total`) and assignment (`expr gain = 6`, read back through OpenOCD).
+Run to the last line, `total` read 83, the value the program is written to end with. `bt` inside the recursive
+function lists all five frames.
 
 What did not, all on the debugger's side and reported to the toolchain project:
 
 - LLDB reads memory in 512-byte lines by default, which made the first disassembly take 14 s at this board's
   500 kHz clock. The toolchain's `pic16f1-lldb` now sets a 32-byte line; a whole session then took 6 s.
-- `bt` inside the recursive function prints only the selected frame, although `frame select 1` shows the callers are found.
-- `p total` fails ("Interpreter couldn't write to memory"): LLDB wants scratch memory at 0x808FF8, which is flash.
-  `target variable total` works.
 - `next` over a call, with a user breakpoint set, stopped inside the called routine: it needs a second breakpoint.
 - A stop at a breakpoint is shown as `signal SIGTRAP` one instruction on, not as a breakpoint hit.
 
