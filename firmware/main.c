@@ -308,6 +308,25 @@ static void process(uint8_t len)
             i += 6;
             break;
 
+        case OP_EE_READ:
+            NEED(2);
+            n = ARG(1);
+            ROOM(n);
+            for (k = 0; k < n; k++)
+                reply[reply_len++] = ee_read((uint8_t)(ARG(0) + k));
+            i += 2;
+            break;
+
+        case OP_EE_WRITE:
+            NEED(2);
+            n = ARG(1);
+            NEED((uint8_t)(2 + n));
+            for (k = 0; k < n; k++)
+                ee_write((uint8_t)(ARG(0) + k), ARG(2 + k));
+            power_load_cal();
+            i += (uint8_t)(2 + n);
+            break;
+
         case OP_G6_CMD:
             NEED(1);
             g6_cmd(ARG(0));

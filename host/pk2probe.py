@@ -8,6 +8,7 @@
     pk2probe.py verify FILE.hex
     pk2probe.py erase
     pk2probe.py power on|off [--vdd MV]    switch target power
+    pk2probe.py calibrate show|run|clear   voltage calibration, stored in the probe
     pk2probe.py scope vdd|vpp|mclr|clock   repeat a waveform for an oscilloscope
 
 Common options: --vdd MV (default 3000), --hvp (enter with VPP on MCLR
@@ -34,6 +35,7 @@ OP_SET_VDD, OP_VDD_MODE, OP_SET_VPP, OP_MCLR = 0x04, 0x05, 0x06, 0x07
 OP_PINS, OP_DELAY_US, OP_DELAY_MS, OP_SPEED = 0x08, 0x09, 0x0A, 0x0B
 OP_LED, OP_CLEAR_FAULTS, OP_BOOTLOADER, OP_RESET = 0x0C, 0x0D, 0x0E, 0x0F
 OP_WRITE_BITS, OP_READ_BITS, OP_KEY = 0x10, 0x11, 0x12
+OP_EE_READ, OP_EE_WRITE = 0x14, 0x15
 OP_G6_CMD, OP_G6_LOAD, OP_G6_READ, OP_G6_READN, OP_G6_LOADN = 0x20, 0x21, 0x22, 0x23, 0x24
 OP_G8_CMD, OP_G8_WRITE, OP_G8_READ, OP_G8_READN, OP_G8_LOADN = 0x30, 0x31, 0x32, 0x33, 0x34
 OP_ICD_READY, OP_ICD_TX, OP_ICD_RX = 0x40, 0x41, 0x42
@@ -794,6 +796,75 @@ def cmd_power(p, args):
     print(f'target VDD {vdd:.2f} V')
 
 
+def cal_from_points(points):
+    """points: list of (setpoint mV, measured V, probe ADC reading V), taken
+    with the calibration at unity.  Returns (adc_cal, vdd_offset, vdd_cal) as
+    stored in the probe EEPROM (the stock PICkit 2 format)."""
+    adc_cal = round(256 * sum(m / a for _, m, a in points) / len(points))
+    # Measured VDD against the nominal duty count d = 32 V + 10.5 is a line.
+    xs = [int((mv * 32 + 10500) / 1000) for mv, _, _ in points]
+    ys = [m for _, m, _ in points]
+    n = len(points)
+    mx, my = sum(xs) / n, sum(ys) / n
+    a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
+    b = my - a * mx
+    vdd_cal = round(4 / a)
+    vdd_offset = round(-32 * b - 10.5)
+    if not (0xC0 <= adc_cal <= 0x140 and 0x50 <= vdd_cal <= 0xAF and -128 <= vdd_offset <= 127):
+        raise ProbeError('calibration out of range: ADC %#x, VDD offset %d, VDD factor %#x'
+                         % (adc_cal, vdd_offset, vdd_cal))
+    return adc_cal, vdd_offset, vdd_cal
+
+
+def cmd_calibrate(p, args):
+    """Voltage calibration.  The PICkit 2 measures and generates voltages
+    relative to its USB supply, so the factors belong to a unit and port."""
+    if args.action == 'show':
+        b = p.run([OP_EE_READ, 0, 4], 4)
+        adc = b[0] | (b[1] << 8)
+        off = b[2] - 256 if b[2] > 127 else b[2]
+        valid = 0xC0 <= adc <= 0x140 and 0x50 <= b[3] <= 0xAF
+        if valid:
+            print('ADC factor %.4f, VDD offset %d counts, VDD factor %.4f' % (adc / 256, off, b[3] / 128))
+        else:
+            print('not calibrated (EEPROM %s); unity factors in use' % b.hex(' '))
+        return
+    if args.action == 'clear':
+        p.run([OP_EE_WRITE, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF])
+        print('calibration cleared')
+        return
+
+    points = []
+    if args.data:
+        for item in args.data.split(','):
+            mv, measured, adc = item.split(':')
+            points.append((int(mv), float(measured), float(adc)))
+    else:
+        print('Connect a voltmeter to VDD (pin 2) and ground (pin 3) of the PICkit 2.')
+        print('Setpoints: %s mV.  Remove any target that cannot take the highest one.'
+              % ', '.join(str(v) for v in args.setpoints))
+        p.run([OP_EE_WRITE, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF])      # unity while measuring
+        p.clear_faults()
+        p.pins(PINS_IDLE)
+        p.mclr(MCLR_RELEASE)
+        try:
+            for mv in args.setpoints:
+                p.set_vdd(mv)
+                p.vdd_mode(VDD_ON)
+                p.flush()
+                time.sleep(0.5)
+                adc = sum(p.voltages()[0] for _ in range(16)) / 16
+                measured = float(input(f'  setpoint {mv / 1000:.2f} V, voltmeter reads (V): '))
+                points.append((mv, measured, adc))
+        finally:
+            p.target_off()
+    if len(points) < 2:
+        raise ProbeError('calibration needs at least two points')
+    adc_cal, off, cal = cal_from_points(points)
+    p.run([OP_EE_WRITE, 0, 4, adc_cal & 0xFF, adc_cal >> 8, off & 0xFF, cal])
+    print('stored: ADC factor %.4f, VDD offset %d counts, VDD factor %.4f' % (adc_cal / 256, off, cal / 128))
+
+
 def cmd_scope(p, args):
     """Repeat a waveform so the rails and pins can be checked on a scope."""
     what = args.what
@@ -869,6 +940,12 @@ def main():
     s = sub.add_parser('verify'); s.add_argument('file'); s.set_defaults(fn=cmd_verify)
     sub.add_parser('erase').set_defaults(fn=cmd_erase)
     s = sub.add_parser('power'); s.add_argument('state', choices=['on', 'off']); s.set_defaults(fn=cmd_power)
+    s = sub.add_parser('calibrate'); s.add_argument('action', choices=['show', 'run', 'clear'])
+    s.add_argument('--setpoints', type=lambda v: [int(x) for x in v.split(',')], default=[2500, 3300, 4500],
+                   metavar='MV,MV', help='VDD setpoints to measure (default 2500,3300,4500)')
+    s.add_argument('--data', metavar='MV:MEASURED:ADC,...',
+                   help='use measurements taken earlier at unity calibration instead of prompting')
+    s.set_defaults(fn=cmd_calibrate)
     s = sub.add_parser('scope'); s.add_argument('what', choices=['vdd', 'vpp', 'mclr', 'clock'])
     s.set_defaults(fn=cmd_scope)
     args = ap.parse_args()

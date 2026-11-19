@@ -54,7 +54,11 @@ void    hw_init(void);
 void    delay_us(uint16_t us);
 void    delay_ms(uint16_t ms);
 
+uint8_t ee_read(uint8_t addr);
+void    ee_write(uint8_t addr, uint8_t value);
+
 void    power_init(void);
+void    power_load_cal(void);
 void    power_isr(void);
 uint8_t power_set_vdd(uint16_t mv);       /* 0 = ok */
 void    power_vdd_mode(uint8_t mode);     /* 0 off, 1 on, 2 off + discharge */

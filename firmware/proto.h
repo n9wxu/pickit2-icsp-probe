@@ -45,6 +45,10 @@
 #define OP_KEY            0x12   /* flags, 4 key bytes (first on the wire first), extra clocks */
 #define BITS_MSB_FIRST    0x01
 
+/* Probe data EEPROM.  Bytes 0-3 hold the voltage calibration. */
+#define OP_EE_READ        0x14   /* address, n -> n bytes */
+#define OP_EE_WRITE       0x15   /* address, n, n bytes; calibration is reloaded */
+
 /* 6 bit command generation */
 #define OP_G6_CMD         0x20   /* cmd */
 #define OP_G6_LOAD        0x21   /* cmd, word u16 */
