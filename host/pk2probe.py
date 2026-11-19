@@ -10,7 +10,7 @@
     pk2probe.py power on|off [--vdd MV]    switch target power
     pk2probe.py scope vdd|vpp|mclr|clock   repeat a waveform for an oscilloscope
 
-Common options: --vdd MV (default 3300), --hvp (enter with VPP on MCLR
+Common options: --vdd MV (default 3000), --hvp (enter with VPP on MCLR
 instead of the low-voltage key sequence), --no-power (target has its own
 supply), --device NAME (skip auto-detection).
 
@@ -220,9 +220,18 @@ class Device:
 
 # Device IDs and memory sizes are from the Microchip device family packs;
 # write latch counts are from the programming specifications.
-DEVICES = [
-    Device('PIC16F1937',  6, 0x2380, 0x3FE0, 8192, 8, 256, 2),
-    Device('PIC16LF1937', 6, 0x2580, 0x3FE0, 8192, 8, 256, 2, vdd_max_mv=3600),
+def _pic16f193x():
+    """PIC16(L)F193x: device ID in bits 13:5 of 0x8006, revision in bits 4:0."""
+    out = []
+    for name, f_id, lf_id, words in [('1933', 0x2300, 0x2400, 4096), ('1934', 0x2340, 0x2440, 4096),
+                                     ('1936', 0x2360, 0x2460, 8192), ('1937', 0x2380, 0x2480, 8192),
+                                     ('1938', 0x23A0, 0x24A0, 16384), ('1939', 0x23C0, 0x24C0, 16384)]:
+        out.append(Device('PIC16F' + name, 6, f_id, 0x3FE0, words, 8, 256, 2))
+        out.append(Device('PIC16LF' + name, 6, lf_id, 0x3FE0, words, 8, 256, 2, vdd_max_mv=3600))
+    return out
+
+
+DEVICES = _pic16f193x() + [
     Device('PIC16F1829',  6, 0x27E0, 0x3FE0, 8192, 32, 256, 2),
     Device('PIC16F1619',  6, 0x307D, 0x3FFF, 8192, 32, 0, 3),
     Device('PIC16F18877', 8, 0x3075, 0x3FFF, 32768, 32, 256, 5),
@@ -552,6 +561,10 @@ def connect(probe, args):
         seen.append((cls.gen, rev, dev))
         d = identify(dev)
         if d is not None and d.gen == cls.gen and (wanted is None or d is wanted):
+            if kw['power'] and kw['vdd_mv'] > d.vdd_max_mv:
+                t.exit()
+                raise ProbeError('%s allows at most %.1f V; --vdd is %.1f V'
+                                 % (d.name, d.vdd_max_mv / 1000, kw['vdd_mv'] / 1000))
             t.device = d
             t.rev = rev
             t.dev_word = dev
@@ -841,7 +854,7 @@ def cmd_scope(p, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--vdd', type=int, default=3300, metavar='MV', help='target VDD in mV (default 3300)')
+    ap.add_argument('--vdd', type=int, default=3000, metavar='MV', help='target VDD in mV (default 3000)')
     ap.add_argument('--vpp', type=int, default=8500, metavar='MV', help='VPP in mV for --hvp (default 8500)')
     ap.add_argument('--hvp', action='store_true', help='high-voltage entry instead of the LVP key')
     ap.add_argument('--no-power', action='store_true', help='target has its own supply')
