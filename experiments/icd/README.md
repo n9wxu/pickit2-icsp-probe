@@ -9,7 +9,8 @@ They are a record, not maintained code.
 - `icdx.py` and `e3lib.py` are the shared helpers: the experimental
   executive, the EEPROM logger, and the `Lab` class that keeps the target
   powered so RAM survives reprogramming.
-- Paths to the project and the oscilloscope are hard-coded.
+- `d9.py` reads the device database of the sibling toolchain project from
+  `~/Documents/pic16f1_toolchain`.
 - `d1.py` and `d7.py` use `Debugger` functions that were changed afterwards
   (a PC setter that never worked, and the earlier `reset()`).
 - `d11.py` needs an executive command (`CMD_RETURN`) that was added for that

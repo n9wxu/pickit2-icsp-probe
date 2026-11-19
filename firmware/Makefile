@@ -25,6 +25,15 @@ $(BUILD)/pk2probe.hex: $(SRCS) $(HDRS) Makefile
 	$(CC) $(CFLAGS) -Wl,-Map=$(BUILD)/pk2probe.map -o $@ $(SRCS)
 	@rm -f *.p1 *.d
 
+# A copy of the image named after the version in proto.h, for a release.
+VERSION := $(shell awk '/define FW_VERSION_MAJOR/{a=$$3} /define FW_VERSION_MINOR/{b=$$3} END{print a "." b}' proto.h)
+
+release: $(BUILD)/pk2probe.hex
+	cp $< $(BUILD)/pk2probe-v$(VERSION).hex
+	@echo $(BUILD)/pk2probe-v$(VERSION).hex
+
+.PHONY: all release clean
+
 clean:
 	rm -rf $(BUILD) *.p1 *.d
 

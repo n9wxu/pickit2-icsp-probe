@@ -3,7 +3,7 @@
 New firmware for the Microchip PICkit 2 that turns it into an open
 programming and debug probe for PIC16F1 microcontrollers, with host tools
 and OpenOCD support. It is the probe for the
-[PIC16F1 open toolchain](../pic16f1_toolchain).
+[PIC16F1 open toolchain](https://github.com/n9wxu/pic16f1-toolchain).
 
 | | |
 |---|---|
@@ -37,9 +37,10 @@ Debugging supports the PIC16(L)F193x only.
 | `openocd/` | OpenOCD patch, build instructions |
 | `docs/protocol.md` | Probe USB protocol |
 | `docs/icd.md` | How on-chip debug works on the PIC16(L)F193x |
+| `docs/releasing.md` | How a release is made |
 | `tools/sds.py` | SCPI helper for a Siglent SDS1000X-E oscilloscope |
 | `test/blink/` | Test program for the F1 Evaluation Platform |
-| `backup/` | The PICkit 2's original firmware and the evaluation board's original program |
+| `backup/` | Not in the repository. `pk2boot.py backup` saves your PICkit 2's original firmware here |
 
 ## Setup
 
@@ -57,6 +58,10 @@ make -C firmware
 
 ## Loading the firmware
 
+A built `pk2probe-vX.Y.hex` is attached to each
+[release](https://github.com/n9wxu/pickit2-icsp-probe/releases); use it in
+place of `firmware/build/pk2probe.hex` below if you do not want to build.
+
 The PICkit 2's factory bootloader stays in place and is never written. The
 probe firmware is an ordinary application for it, loaded over USB:
 
@@ -66,7 +71,8 @@ probe firmware is an ordinary application for it, loaded over USB:
 .venv/bin/python host/pk2boot.py info
 ```
 
-To go back to the stock firmware:
+To go back to the stock firmware, load the backup you made. It is
+Microchip's code, so it is kept out of the repository:
 
 ```sh
 .venv/bin/python host/pk2boot.py flash backup/pickit2_app.hex
