@@ -1,0 +1,11 @@
+executive: 127 words of 240
+halted at PC=0001, STKPTR=1F
+RETURN to 0230 with the breakpoint disabled:
+   pushed 0230: STKPTR=00 TOS=0230
+   came back by itself, PC=0001, STKPTR=00, PCLATH=00, F8E=80, counters [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+RETURN to 1340 with the breakpoint disabled:
+   pushed 1340: STKPTR=01 TOS=1340
+   came back by itself, PC=0001, STKPTR=01, PCLATH=00, F8E=80, counters [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+RETURN to 0230 with the breakpoint on that address:
+   pushed 0230: STKPTR=02 TOS=0230
+   could not halt: the target did not halt; is it programmed for debugging and powered?

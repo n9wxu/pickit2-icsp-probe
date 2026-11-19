@@ -78,7 +78,7 @@ from the debug-header definitions in the device pack.
 |---|---|
 | 0xF8C | Debug pins. Bit 7 ICSPDAT, bit 6 ICSPCLK: write sets the output level, read gives the pin. Bit 3 ICSPDAT direction, bit 2 ICSPCLK direction (1 = input). The state persists while user code runs |
 | 0xF8D | Reads back the same output latches and direction bits |
-| 0xF8E | Bit 7 reads 1 in debug mode and cannot be written. Bits 6 and 5 are writable; their effect was not investigated |
+| 0xF8E | Bit 7 reads 1 in debug mode and cannot be written. Bit 5 is a single step: with it set, a resume executes one instruction and comes back, without using the breakpoint. Bit 6 is writable; no effect was seen |
 | 0xF90 | Read: PC at the halt, low byte. Write: breakpoint address, low byte |
 | 0xF91 | Same, high 7 bits. Bit 7 enables the breakpoint |
 | 0xFE3 | The user's BSR, saved on entry and restored on return |
@@ -90,6 +90,12 @@ instruction, so exactly one instruction runs. That is the single step.
 Writing 0xF91:0xF90 sets the breakpoint only. It does not change where
 execution resumes, and no way of changing the PC of a halted target was
 found.
+
+No other debug register exists in the data space. Every address that the
+production register map leaves undocumented reads zero in debug mode and
+ignores writes, apart from the ones in this table (D9, D10). In particular
+there is no register for handing the core an instruction to execute, which
+the debug-header variant's `ICDINST` and `DBGINEX` names describe.
 
 `W`, `STATUS`, `PCLATH` and the FSRs are not saved by the hardware. `BSR` is.
 
@@ -133,9 +139,12 @@ The host does the rest by reading and writing memory.
 
 - One hardware breakpoint, which the single step also uses.
 - Breakpoints stop one instruction late.
-- The PC cannot be changed, so software breakpoints cannot be made
-  transparent: after the trap there is no way to go back and execute the
-  instruction it replaced.
+- The PC cannot be changed. After a software breakpoint the PC is already
+  past it, so the instruction it replaced cannot be re-run from flash. It
+  would have to be carried out some other way; see "Software breakpoints"
+  below. The debugger does not implement them.
+- The single-step bit in 0xF8E is not used yet. Stepping still borrows the
+  hardware breakpoint.
 - Program memory is not read from the target during a session. The host
   keeps the image it programmed.
 - The executive needs about 2.5 ms per byte at the 500 kHz reset clock, so a
@@ -610,6 +619,104 @@ pulses MCLR.
 
 User code runs for a few milliseconds between the resume and the reset.
 
+## Phase 7: software breakpoints and moving the PC
+
+The owner of the board supplied two recollections at this point. A software
+breakpoint replaces an instruction in flash with a break instruction. And
+software breakpoints are not thought to be restricted to particular
+instructions. Whether the executive executes the replaced instruction was
+not known.
+
+D7 had already found the break instruction. The difficulty is what comes
+next: the executive regains control with the PC one past the breakpoint, so
+the original instruction has to be carried out some other way. Two
+mechanisms were considered. Either the hardware executes an instruction
+handed to it by the debugger, which is what the header variant's `ICDINST`
+and `DBGINEX` names suggest, or the PC can be moved after all. An
+unrestricted breakpoint needs one of them, because an executive that simply
+runs the original instruction itself cannot do a `GOTO`, a `CALL` or a skip
+on the user's behalf.
+
+### D9. Scan of the data space, and the two control bits
+
+`d9.py`, output in `d9.out`. The production register map (from the
+toolchain's device database) was used to list every data address that is
+neither a documented register nor RAM: 2,559 addresses.
+
+| Part | Result |
+|---|---|
+| A. Read all 2,559 in debug mode | Non-zero only at 0xF8C, 0xF8D, 0xF8E, 0xF90, 0xF91: the registers already known |
+| B. Write 0xFF and 0x00 to the 83 undocumented addresses of bank 31 not already known | None accepted a write |
+| C. Bit 5 of 0xF8E set, breakpoint disabled, resume | **Came back by itself after one instruction**, PC 0x0001 to 0x0002. The bit stayed set |
+| C. Bit 6 of 0xF8E set, breakpoint disabled, resume | Ran freely until halted. No difference seen |
+
+Conclusion: bit 5 is a single step that does not need the breakpoint. No
+instruction register in bank 31.
+
+### D10. Write test of the other banks
+
+`d10.py`, output in `d10.out`. D9 only read the addresses outside bank 31,
+and a register that reads zero but accepts writes would have been missed.
+All 2,470 were written with 0xFF and 0x00 and read back.
+
+Result: none accepted a write. The executive was still responsive
+afterwards.
+
+Conclusion: the production part has no instruction-execute register in its
+data space.
+
+### D11. RETURN through the user's stack
+
+`d11.py`, output in `d11.out`. The earlier `RETURN` tests (E6, X4) had an
+empty stack. Here the host pushed a target address first: `STKPTR`
+incremented, `TOSH:TOSL` written, both read back correctly. An experimental
+fourth executive command then restored the registers and executed `RETURN`
+instead of opcode 0x0004.
+
+| Target | Result |
+|---|---|
+| 0x0230 | The executive came straight back. PC still 0x0001. `STKPTR` still incremented. The counters at the target were untouched |
+| 0x1340 | The same |
+| 0x0230 with the breakpoint armed on it | Contact lost; the target needed reloading |
+
+Conclusion: `RETURN` in the debug space does not use the user's stack. It
+restarts the executive. This matches X1, where a `CALL` in the executive did
+not move `STKPTR`. The experimental command was removed again.
+
+### Software breakpoints: where this leaves them
+
+On this part, by experiment:
+
+- the break instruction exists (0x0002, 0x0003);
+- nothing in the data space executes a supplied instruction;
+- the PC cannot be moved by writing the breakpoint register or through the
+  stack.
+
+So the mechanism that makes an unrestricted software breakpoint possible has
+not been found, and may not be in the places examined. What could be built
+from what is proven:
+
+| Replaced instruction | Can be carried out by |
+|---|---|
+| Anything that does not change the PC | The host, by reading and writing registers and memory through the executive, or the executive running the instruction itself with the user's registers restored. The PC is already correct afterwards |
+| `GOTO`, `CALL`, `RETURN`, `RETFIE`, `BRA`, `BRW`, `CALLW`, skips, writes to `PCL` | Nothing found |
+
+That would be a restricted software breakpoint, with the hardware breakpoint
+for the remaining cases. It also needs the executive to write flash during a
+session, which means adding the self-write unlock sequence to it; reprogramming
+over ICSP resets the target. None of this is implemented.
+
+### A race in reset
+
+Found while checking the OpenOCD port, not by an experiment here. The port
+resumed the target and pulsed MCLR within a few hundred microseconds. The
+executive had not yet finished restoring the registers and left debug mode,
+where MCLR is ignored, so the pulse was lost and the port fell back to a
+power cycle every time. The Python debugger had the same race and only
+worked because it is slower. Both now wait 10 ms between the resume and the
+pulse. With that, three resets in a row through OpenOCD stopped at the reset
+vector with no power cycle.
+
 ## Mistakes and corrections
 
 | What | Where | How it was caught |
@@ -623,21 +730,22 @@ User code runs for a few milliseconds between the resume and the reset.
 | "Set PC" believed to work | D1 | D2, D3, D5 |
 | "Reset" believed to work | D1, D7 | D8 |
 | Probe firmware raised a false power fault during debug traffic | D1 | Fixed in `firmware/power.c` |
+| Reset pulsed MCLR before the executive had left debug mode | D8, OpenOCD port | The port fell back to a power cycle every time; a delay was added |
+| Only two windows of the register space examined | X2, X3 | Whole data space scanned in D9 and D10 |
 
 ## Open questions
 
-- Bits 6 and 5 of 0xF8E are writable and were not tested. The header names
-  suggest freeze-peripherals and single-step. The EEPROM never produced a
-  log from debug mode, which may or may not be related; in E2 the executive
-  was not running at all.
+- What bit 6 of 0xF8E does. The header name suggests it freezes
+  peripherals while halted. That was not tested with a running peripheral.
+- How Microchip's tools make software breakpoints work on any instruction,
+  which the owner of the board believes they do. See "Software breakpoints".
 - 0xF8D mirrors the pin latches. Whether it has another use is unknown.
 - How many levels the debug-mode call stack has. The executive uses one.
-- Whether the PC of a halted target can be changed by any means. Nothing
-  tried here did it.
+- Whether the PC of a halted target can be changed by any means. Writing
+  the breakpoint register does not (D5), and neither does a `RETURN` through
+  the user's stack (D11).
 - Why `RETURN` in X4 recorded no entries.
-- The header variant names an `ICDINST` register pair and a `DBGINEX` bit,
-  for executing an instruction supplied by the debugger. Nothing was found
-  at those addresses on the production part.
-- Whether a second breakpoint or a data breakpoint exists anywhere else in
-  the register space. Only 0xF8C–0xF9F and 0xFE0–0xFEF were examined.
+- Whether the executive's own program space offers something the data
+  space does not. Only the behaviour of opcodes 0x0002–0x0007, 0x000C–0x000F,
+  0x0060 and 0x0061 was tested there.
 - Whether any of this holds on other revisions and other PIC16F1 parts.
