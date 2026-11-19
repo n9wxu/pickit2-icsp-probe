@@ -148,7 +148,11 @@ off, the "VPP" level is the VDD setpoint.
 
 ## License
 
-To be decided. The probe firmware and host tools contain no Microchip code.
-The pin assignments, voltage scaling and debug-link handshake were taken from
-the PICkit 2 schematic and from reading Microchip's published PICkit 2
-firmware source as a reference.
+MIT, see [LICENSE](LICENSE). The one exception is
+`openocd/pk2icsp-pic16f1.patch`: it is a change to OpenOCD and is under
+OpenOCD's license, GPL-2.0-or-later.
+
+The probe firmware and host tools contain no Microchip code. The pin
+assignments, voltage scaling and debug-link handshake were taken from the
+PICkit 2 schematic and from reading Microchip's published PICkit 2 firmware
+source as a reference.
