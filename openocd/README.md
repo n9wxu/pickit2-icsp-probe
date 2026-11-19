@@ -151,9 +151,11 @@ name and by source line, `continue`, `stepi`, `bt` through inlined frames and a 
 
 What did not, all on the debugger's side and reported to the toolchain project:
 
-- LLDB reads memory in 512-byte lines. The first disassembly therefore reads 256 words of program memory, 14 s at
-  this board's 500 kHz clock.
-- `bt` inside the recursive function showed only the innermost frame.
+- LLDB reads memory in 512-byte lines by default, which made the first disassembly take 14 s at this board's
+  500 kHz clock. The toolchain's `pic16f1-lldb` now sets a 32-byte line; a whole session then took 6 s.
+- `bt` inside the recursive function prints only the selected frame, although `frame select 1` shows the callers are found.
+- `p total` fails ("Interpreter couldn't write to memory"): LLDB wants scratch memory at 0x808FF8, which is flash.
+  `target variable total` works.
 - `next` over a call, with a user breakpoint set, stopped inside the called routine: it needs a second breakpoint.
 - A stop at a breakpoint is shown as `signal SIGTRAP` one instruction on, not as a breakpoint hit.
 
