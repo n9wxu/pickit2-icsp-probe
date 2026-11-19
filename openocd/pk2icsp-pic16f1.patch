@@ -1847,10 +1847,10 @@ index 4687092..32e0fb5 100644
  	%D%/arm_cti.h \
 diff --git a/src/target/pic16f1.c b/src/target/pic16f1.c
 new file mode 100644
-index 0000000..3388b53
+index 0000000..681473e
 --- /dev/null
 +++ b/src/target/pic16f1.c
-@@ -0,0 +1,1440 @@
+@@ -0,0 +1,1459 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +/*
@@ -1883,7 +1883,8 @@ index 0000000..3388b53
 + *    memory through EEADR/EECON1/EEDAT. They cannot be written.
 + *  - The hardware return stack is at 0x810000: 16 slots of two bytes,
 + *    little endian, each the WORD address the silicon holds (TOSH:TOSL).
-+ *    Slot stkptr is the top; stkptr 0x1F means empty. Read only.
++ *    Slot stkptr is the top; stkptr 0x1F means empty. Read only. Reads
++ *    past the 32 bytes return zeros.
 + *
 + * The hardware breakpoint halts AFTER the instruction at its address has
 + * executed (skid of one instruction). There is one breakpoint, and single
@@ -2458,8 +2459,13 @@ index 0000000..3388b53
 +
 +	if (target->state != TARGET_HALTED) {
 +		retval = pic16f1_halt(target);
-+		if (retval != ERROR_OK)
-+			return retval;
++		if (retval != ERROR_OK) {
++			/* A target in SLEEP does not answer the halt request, and an
++			 * MCLR reset with ICSPCLK held high did not stop it either
++			 * when that was tried. Only a power cycle is left. */
++			LOG_INFO("pic16f1: no answer to the halt request (is the target in SLEEP?)");
++			goto power_cycle;
++		}
 +	}
 +	retval = set_breakpoint_hw(0);
 +	if (retval == ERROR_OK)
@@ -2494,11 +2500,12 @@ index 0000000..3388b53
 +		}
 +	}
 +
++power_cycle:
 +	if (!c || !c->power) {
 +		LOG_ERROR("pic16f1: the target did not stop after an MCLR reset");
 +		return ERROR_TARGET_FAILURE;
 +	}
-+	LOG_INFO("pic16f1: MCLR reset had no effect, power cycling the target");
++	LOG_INFO("pic16f1: power cycling the target to reset it");
 +	icsp_pins(ICSP_PINS_IDLE);
 +	icsp_vdd_mode(ICSP_VDD_DISCHARGE);
 +	icsp_delay_ms(100);
@@ -2817,11 +2824,18 @@ index 0000000..3388b53
 +	if (address < DATA_BASE)
 +		return read_code_space(target, address, total, buffer);
 +	if (address >= STACK_BASE) {
-+		if (address - STACK_BASE + total > 2 * STACK_LEVELS) {
-+			LOG_ERROR("pic16f1: the return stack is %d bytes at 0x%x", 2 * STACK_LEVELS, STACK_BASE);
-+			return ERROR_FAIL;
-+		}
-+		return read_return_stack(address - STACK_BASE, total, buffer);
++		/* The 16 levels, then zeros: a debugger's memory cache reads
++		 * whole lines of some hundred bytes around what it wants. */
++		uint32_t off = address - STACK_BASE;
++		uint8_t levels[2 * STACK_LEVELS];
++
++		memset(buffer, 0, total);
++		if (off >= sizeof(levels))
++			return ERROR_OK;
++		int r = read_return_stack(0, sizeof(levels), levels);
++		if (r == ERROR_OK)
++			memcpy(buffer, levels + off, MIN(total, (uint32_t)sizeof(levels) - off));
++		return r;
 +	}
 +
 +	int retval = check_data_access(target, address, total);
@@ -2879,6 +2893,11 @@ index 0000000..3388b53
 +
 +	uint32_t base = address - DATA_BASE;
 +
++	if (base + total > 0x8000) {
++		LOG_ERROR("pic16f1: 0x%" TARGET_PRIxADDR " is program memory seen through the data "
++			"space, which cannot be written during a debug session", address);
++		return ERROR_FAIL;
++	}
 +	for (uint32_t i = 0; i < total; i++) {
 +		uint32_t a = base + i;
 +		if (a < 0x1000 && (a & 0x7F) == 0x02) {
@@ -3368,10 +3387,10 @@ index 0000000..7e2714b
 +#endif /* OPENOCD_TARGET_PIC16F1_EXEC_H */
 diff --git a/src/target/pic16f1_icsp.c b/src/target/pic16f1_icsp.c
 new file mode 100644
-index 0000000..3cca4e9
+index 0000000..7e1e90a
 --- /dev/null
 +++ b/src/target/pic16f1_icsp.c
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,436 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +/*
@@ -3769,8 +3788,18 @@ index 0000000..3cca4e9
 +			} else if (a >= PIC16F1_BASE_EEPROM && a < PIC16F1_BASE_EEPROM + 2 * dev->eeprom) {
 +				ep[a - PIC16F1_BASE_EEPROM] = true;
 +				eb[a - PIC16F1_BASE_EEPROM] = data[i];
++			} else if (a >= PIC16F1_FLASH_DATA && a < PIC16F1_FLASH_DATA + dev->flash_words) {
++				/* ELF of the PIC16F1 toolchain: data with a load address
++				 * in the flash data range is one byte per program word,
++				 * stored as RETLW (0x34xx) at word a - 0x808000 */
++				uint32_t w = a - PIC16F1_FLASH_DATA;
++				fb[2 * w] = data[i];
++				fb[2 * w + 1] = 0x34;
++				fp[2 * w] = true;
++				fp[2 * w + 1] = true;
 +			} else {
-+				LOG_DEBUG("pic16f1: ignoring HEX data at byte address 0x%05" PRIx32, a);
++				/* RAM sections of an ELF file, and anything else */
++				LOG_DEBUG("pic16f1: ignoring image data at byte address 0x%05" PRIx32, a);
 +			}
 +		}
 +		free(data);
@@ -3800,10 +3829,10 @@ index 0000000..3cca4e9
 +}
 diff --git a/src/target/pic16f1_icsp.h b/src/target/pic16f1_icsp.h
 new file mode 100644
-index 0000000..1717aea
+index 0000000..1365072
 --- /dev/null
 +++ b/src/target/pic16f1_icsp.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,127 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +
 +/*
@@ -3842,6 +3871,7 @@ index 0000000..1717aea
 +#define PIC16F1_BASE_FLASH     0x00000
 +#define PIC16F1_BASE_CONFIG    0x10000
 +#define PIC16F1_BASE_EEPROM    0x1E000
++#define PIC16F1_FLASH_DATA     0x808000  /* program memory as an FSR reads it (ELF load addresses) */
 +
 +/* PIC16(L)F193x: DEBUG is bit 12 of configuration word 2; 0 = enabled */
 +#define PIC16F1_CONFIG2_ADDR   0x8008

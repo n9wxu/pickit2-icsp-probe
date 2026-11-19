@@ -110,7 +110,8 @@ too, an `E` reply to `P`). The values are read once on every halt, 27 bytes in o
 - **Flash through the data space**: 0x808000 and up is program memory as an FSR sees it, the low 8 bits of each word,
   one byte per word.
 - **The hardware return stack is at 0x810000**: 16 slots of two bytes, little endian, slot `n` at 0x810000 + 2n. Each
-  holds the word address the silicon keeps (not doubled). Slot `stkptr` is the top of the stack. Read only.
+  holds the word address the silicon keeps (not doubled). Slot `stkptr` is the top of the stack. Read only. Reads
+  past the 32 bytes return zeros, because a debugger's memory cache reads more than it was asked for.
 - **Program memory can be read from a halted target** at its code address, two bytes per word. So can the configuration
   space at 0x10000 (user IDs, device ID at 0x1000C, configuration words at 0x1000E) and the data EEPROM at 0x1E000
   (one word per byte). The driver has the part read its own memory through `EEADR`/`EECON1`/`EEDAT` and puts the
@@ -130,6 +131,31 @@ Checked with raw packets on the PIC16LF1937 (the list the toolchain's LLDB plugi
 - `Z0` and `Z1` both use the one hardware breakpoint. A second breakpoint gets an `E` reply.
 - A stop is reported with the true pc: after a breakpoint that is the instruction after the breakpoint address.
 - There is no thread list (`qfThreadInfo` answers `l`) and no `qHostInfo`; stop replies are `T05` without a thread.
+
+### LLDB from the PIC16F1 toolchain
+
+Tried on the PIC16LF1937 with the toolchain's `examples/debug/main.c`, with configuration words added
+(`PIC_CONFIG_WORDS(0x09C4, 0x3EFF);`; the toolchain ignores `#pragma config`, and a part with erased configuration
+words expects an external clock and does not run):
+
+```sh
+pic16f1-cc -g -O1 -mcpu=pic16f1937 -o prog.hex main.c         # leaves prog.elf beside it
+src/openocd -s tcl -f interface/pk2icsp.cfg -c "pk2icsp vdd 3300" -c "pk2icsp hvp on" \
+    -f target/pic16f193x.cfg -c "init; pic16f1 load_debug prog.elf"
+pic16f1-lldb prog.elf -o "gdb-remote 3333"
+```
+
+What worked: connecting, the register display including the compiler's pairs, disassembly, breakpoints by function
+name and by source line, `continue`, `stepi`, `bt` through inlined frames and a library routine, `frame variable`,
+`target variable`. Run to the last line, `total` read 83, the value the program is written to end with.
+
+What did not, all on the debugger's side and reported to the toolchain project:
+
+- LLDB reads memory in 512-byte lines. The first disassembly therefore reads 256 words of program memory, 14 s at
+  this board's 500 kHz clock.
+- `bt` inside the recursive function showed only the innermost frame.
+- `next` over a call, with a user breakpoint set, stopped inside the called routine: it needs a second breakpoint.
+- A stop at a breakpoint is shown as `signal SIGTRAP` one instruction on, not as a breakpoint hit.
 
 ### Speed
 
@@ -226,11 +252,14 @@ pc (/32): 0x00000ff0
   cannot be made transparent), no watchpoints.
 - The pc cannot be written. `resume`/`step` at an address fail.
 - Program memory is read-only while debugging, and slow to read at a low target clock (see "Speed").
-- ELF input to `load_debug` goes through OpenOCD's ELF loader and has not been tried; only HEX files were used.
+- ELF input to `load_debug` was tried with one file from the PIC16F1 toolchain. Data whose load address is in
+  0x808000 and up is programmed as `RETLW` words, as that toolchain's HEX conversion does; RAM sections are skipped.
+- **A target in `SLEEP` cannot be halted.** `reset` then power cycles it, which needs `pk2icsp power on`. A
+  breakpoint before the `SLEEP` is the way to stop a program that ends that way.
 - Erase is a bulk erase of the whole device (no sector or row erase). Config words can only be rewritten after a bulk erase.
 - Programming mode entry resets the target and ends any debug session. The device is not code-protected-aware: with code protection
   enabled reads return zeros and verification fails.
-- `reset` resumes the target and then pulses MCLR. If MCLR is configured as a digital input (MCLRE = 0) the
+- `reset` halts the target, resumes it and then pulses MCLR. If MCLR is configured as a digital input (MCLRE = 0) the
   pulse has no effect and the target is power cycled instead, which needs `pk2icsp power on`. A self-powered
   target with MCLRE = 0 cannot be reset.
 - Register and memory access over the executive link is slow at a low target clock (see "Speed").

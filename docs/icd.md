@@ -151,6 +151,9 @@ The host does the rest by reading and writing memory.
 - The executive needs about 2.5 ms per byte at the 500 kHz reset clock, so a
   register read takes about 10 ms.
 - `DEBUG` enabled means ICSPCLK and ICSPDAT belong to the debugger.
+- A target that has executed `SLEEP` does not answer the halt request. An
+  MCLR pulse with ICSPCLK held high across its release did not stop it
+  either. A power cycle does.
 
 # Development record
 
@@ -804,4 +807,6 @@ executive. Not tried.
 - Whether the executive's own program space offers something the data
   space does not. Only the behaviour of opcodes 0x0002–0x0007, 0x000C–0x000F,
   0x0060 and 0x0061 was tested there.
+- How a sleeping target is halted. Seen with the OpenOCD target while
+  running a program that ends in `SLEEP`; not examined with an experiment.
 - Whether any of this holds on other revisions and other PIC16F1 parts.

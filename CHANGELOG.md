@@ -14,4 +14,5 @@ Firmware 0.1, protocol 1. Verified on a PIC16LF1937 only.
   program memory, configuration space and EEPROM readable from a halted
   target; hardware return stack at 0x810000; registers `r0`-`r13`, `tmp0`,
   `tmp1`; 32-bit `pc`; connecting a debugger halts the target without
-  resetting it.
+  resetting it; `load_debug` takes the toolchain's ELF files. A session
+  with the toolchain's LLDB ran on the PIC16LF1937.
