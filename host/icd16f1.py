@@ -12,8 +12,10 @@ With the DEBUG configuration bit programmed (0), the core has a second,
 that holds the configuration words and, from 0x8010 to 0x80FF, room for a
 debug executive.  The core enters that space at the debug vector, 0x8004:
 
-  * after executing one user instruction, when the step flag is set.  The
-    flag is set by power-on reset, so a fresh target stops at PC = 1;
+  * after executing the instruction at the hardware breakpoint address,
+    when the breakpoint is enabled.  Power-on reset enables it at address
+    0, so a fresh target stops with PC = 1;
+  * after executing opcode 0x0002, a software breakpoint;
   * when ICSPCLK is driven high while user code runs (external halt).
 
 In debug mode these registers in bank 31 matter:
@@ -21,12 +23,15 @@ In debug mode these registers in bank 31 matter:
   0xF8C  debug pins: bit 7 ICSPDAT, bit 6 ICSPCLK (write: output level,
          read: pin), bit 3 ICSPDAT direction, bit 2 ICSPCLK direction (1 = input)
   0xF8E  bit 7 reads 1 in debug mode
-  0xF90  saved user PC, low byte
-  0xF91  saved user PC, high 7 bits; bit 7 is the step flag
+  0xF90  read: PC at the halt.  Write: hardware breakpoint address.
+  0xF91  (high 7 bits); bit 7 enables the breakpoint.  After a halt the pair
+         holds the current PC, so resuming with the enable bit still set
+         executes exactly one instruction: that is the single step.
   0xFE3  the user's BSR, saved on entry and restored on return
 
-Opcode 0x0004 returns to user code at the saved PC.  W, STATUS, the FSRs
-and PCLATH are not saved by the hardware.
+Opcode 0x0004 returns to user code where it stopped; no way of changing
+that address has been found.  W, STATUS, the FSRs and PCLATH are not
+saved by the hardware.
 
 The executive
 -------------
@@ -40,13 +45,16 @@ debug link (firmware/icsp.c describes the link):
 
 Everything else (registers, PC, stepping, breakpoints) is done by the host
 with those three commands.
+
+Breakpoints stop after the instruction, not before it ("skid" of one).
 """
 import time
 
 from asm14 import Asm, W, F, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, INDF0, INDF1, Z
 from pk2probe import (ProbeError, Gen6, identify, split_image, verify, BLANK,
                       OP_G6_CMD, OP_ICD_TX, OP_ICD_RX, OP_ICD_READY,
-                      PINS_IDLE, PIN_CLK, PIN_DAT_IN, MCLR_GROUND, MCLR_RELEASE)
+                      PINS_IDLE, PIN_CLK, PIN_DAT_IN, MCLR_GROUND, MCLR_RELEASE,
+                      VDD_OFF, VDD_ON, VDD_DISCHARGE)
 
 # ---- Device facts (PIC16(L)F193x) ---------------------------------------
 
@@ -62,7 +70,7 @@ REG_CTRL = 0xF8E
 REG_PCL = 0xF90
 REG_PCH = 0xF91
 REG_BSR = 0xFE3
-STEP_FLAG = 0x80
+BREAK_ENABLE = 0x80
 
 OP_DEBUG_RETURN = 0x0004
 
@@ -233,7 +241,6 @@ class Debugger:
         self.power = power
         self.device = None
         self.image = {}                 # user program, for reading program memory
-        self.breakpoints = set()
 
     # -- loading -----------------------------------------------------------
 
@@ -373,65 +380,72 @@ class Debugger:
         if not self._wait_halted(0.5):
             raise DebugError('the target did not halt; is it programmed for debugging and powered?')
 
-    def _go(self, step):
-        pch = self.read8(REG_PCH)
-        want = (pch | STEP_FLAG) if step else (pch & ~STEP_FLAG)
-        if want != pch:
-            self.write8(REG_PCH, want)
-        self._xfer([CMD_GO])
+    def set_breakpoint(self, addr):
+        """Arm the hardware breakpoint.  The target halts after it has
+        executed the instruction at addr (there is one breakpoint)."""
+        self.write8(REG_PCL, addr & 0xFF)
+        self.write8(REG_PCH, ((addr >> 8) & 0x7F) | BREAK_ENABLE)
+
+    def clear_breakpoint(self):
+        self.write8(REG_PCH, self.read8(REG_PCH) & ~BREAK_ENABLE & 0xFF)
 
     def step(self):
-        """Execute one instruction."""
-        self._go(True)
+        """Execute one instruction: a breakpoint on the current instruction."""
+        self.set_breakpoint(self.pc)
+        self._xfer([CMD_GO])
         if not self._wait_halted(1.0):
             raise DebugError('the target did not come back from a single step')
 
-    def resume(self):
-        """Run.  With breakpoints set the target is stepped by the host until
-        it reaches one, which is slow; see run_to_breakpoint()."""
-        self._go(False)
+    def resume(self, breakpoint=None):
+        """Run until halt() or, if given, until the instruction at
+        breakpoint has executed."""
+        if breakpoint is None:
+            self.clear_breakpoint()
+        else:
+            self.set_breakpoint(breakpoint)
+        self._xfer([CMD_GO])
 
-    def run_to_breakpoint(self, max_steps=100000, poll=None):
-        """Step until the PC is at a breakpoint.  Returns the PC, or None if
-        poll() returned true (a request to stop) or max_steps ran out."""
-        for _ in range(max_steps):
-            self.step()
-            pc = self.pc
-            if pc in self.breakpoints:
-                return pc
-            if poll and poll():
-                return None
-        return None
+    def wait(self, timeout):
+        """Wait for a running target to stop at a breakpoint or trap."""
+        return self._wait_halted(timeout)
 
     def reset(self):
-        """Reset the target and stop it.  The instruction at the reset vector
-        has been executed when the target stops, so the PC is then set back
-        to 0: start programs with a NOP or a GOTO."""
+        """Reset the target and stop it after the instruction at the reset
+        vector (PC = 1, or the target of a GOTO placed there).
+
+        MCLR has no effect while the executive is running, so the target is
+        resumed with the breakpoint on address 0 and then reset; the
+        breakpoint register survives the reset.  User code runs for a moment
+        in between.  If MCLR is not a reset input, the probe power-cycles
+        the target instead, which arms the same breakpoint."""
+        p = self.p
         if not self.halted():
             self.halt()
-        self.write8(REG_PCH, self.read8(REG_PCH) | STEP_FLAG)
-        p = self.p
+        self.resume(breakpoint=0)
         p.mclr(MCLR_GROUND)
         p.delay_ms(2)
         p.pins(PINS_IDLE)
         p.mclr(MCLR_RELEASE)
         p.flush()
+        if self._wait_halted(0.5) and self.pc <= 1:
+            self.write8(REG_BSR, 0)     # the saved copy is not cleared by the reset
+            return
+        if not self.power:
+            raise DebugError('the target did not stop after an MCLR reset')
+        p.pins(PINS_IDLE)
+        p.vdd_mode(VDD_DISCHARGE)
+        p.delay_ms(100)
+        p.vdd_mode(VDD_OFF)
+        p.vdd_mode(VDD_ON)
+        p.flush()
         if not self._wait_halted(1.0):
-            raise DebugError('the target did not stop after reset')
-        self.write8(REG_BSR, 0)         # the saved copy is not cleared by the reset
-        self.pc = 0
+            raise DebugError('the target did not stop after a power cycle')
 
     # -- registers ---------------------------------------------------------
 
     @property
     def pc(self):
         return self.read8(REG_PCL) | ((self.read8(REG_PCH) & 0x7F) << 8)
-
-    @pc.setter
-    def pc(self, value):
-        flag = self.read8(REG_PCH) & STEP_FLAG
-        self.write8(REG_PCL, value & 0xFF)
-        self.write8(REG_PCH, ((value >> 8) & 0x7F) | flag)
 
     # Where the user's value of a core register lives while halted
     _HOME = {0x004: SAVE_FSR0L, 0x005: SAVE_FSR0H, 0x006: SAVE_FSR1L, 0x007: SAVE_FSR1H,
@@ -460,7 +474,7 @@ class Debugger:
         if addr < 0x1000 and (addr & 0x7F) == 0x03:
             self.write8(SAVE_STATUS, ((value << 4) | (value >> 4)) & 0xFF)
         elif addr < 0x1000 and (addr & 0x7F) == 0x02:
-            self.pc = (self.pc & 0x7F00) | (value & 0xFF)
+            raise DebugError('the program counter of a halted target cannot be changed')
         else:
             self.write8(self._map(addr), value)
 
