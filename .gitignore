@@ -1,0 +1,6 @@
+firmware/build/
+*.p1
+*.d
+__pycache__/
+.venv/
+.DS_Store
