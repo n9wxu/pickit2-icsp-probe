@@ -46,10 +46,10 @@ index b9353d8..e760a3f 100644
  	&psoc5lp_flash,
 diff --git a/src/flash/nor/pic16f1.c b/src/flash/nor/pic16f1.c
 new file mode 100644
-index 0000000..04bf8ae
+index 0000000..970c987
 --- /dev/null
 +++ b/src/flash/nor/pic16f1.c
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,572 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +/*
@@ -196,15 +196,20 @@ index 0000000..04bf8ae
 +{
 +	struct pic16f1_bank *b = bank->driver_priv;
 +	const struct pic16f1_device *dev;
-+	uint16_t rev, devw;
++	uint16_t rev = 0, devw;
 +
 +	b->probed = false;
-+	int retval = pic16f1_connect(&dev, &rev, &devw);
-+	if (retval != ERROR_OK)
-+		return retval;
-+	retval = session_end(bank);
-+	if (retval != ERROR_OK)
-+		return retval;
++	/* A target halted in a debug session is asked through the debug
++	 * executive; programming mode would reset it and lose the session. */
++	int retval = pic16f1_target_identify(bank->target, &dev, &devw);
++	if (retval != ERROR_OK) {
++		retval = pic16f1_connect(&dev, &rev, &devw);
++		if (retval != ERROR_OK)
++			return retval;
++		retval = session_end(bank);
++		if (retval != ERROR_OK)
++			return retval;
++	}
 +
 +	probed_device = dev;
 +	probed_rev = devw & ~dev->id_mask & 0x3FFF;
@@ -1842,10 +1847,10 @@ index 4687092..32e0fb5 100644
  	%D%/arm_cti.h \
 diff --git a/src/target/pic16f1.c b/src/target/pic16f1.c
 new file mode 100644
-index 0000000..5a4266f
+index 0000000..3388b53
 --- /dev/null
 +++ b/src/target/pic16f1.c
-@@ -0,0 +1,1180 @@
+@@ -0,0 +1,1440 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +/*
@@ -1872,7 +1877,13 @@ index 0000000..5a4266f
 + *  - Data memory is at 0x800000 + address, where address is the
 + *    register-file address 0x000-0xFFF (bank * 0x80 + offset) or a linear
 + *    address 0x2000 and up, as the CPU sees it.
-+ *  - Program memory cannot be read from a running debug session.
++ *  - Program memory, the configuration space (byte address 0x10000) and
++ *    the data EEPROM (0x1E000, one word per byte as in HEX files) can be
++ *    read from a halted target at those addresses; the part reads its own
++ *    memory through EEADR/EECON1/EEDAT. They cannot be written.
++ *  - The hardware return stack is at 0x810000: 16 slots of two bytes,
++ *    little endian, each the WORD address the silicon holds (TOSH:TOSL).
++ *    Slot stkptr is the top; stkptr 0x1F means empty. Read only.
 + *
 + * The hardware breakpoint halts AFTER the instruction at its address has
 + * executed (skid of one instruction). There is one breakpoint, and single
@@ -1899,6 +1910,8 @@ index 0000000..5a4266f
 +#define PIC16F1_MAGIC       0x50313646U
 +#define DATA_BASE           0x800000
 +#define DATA_SPACE          0x10000
++#define STACK_BASE          0x810000
++#define STACK_LEVELS        16
 +
 +/* Executive commands */
 +#define CMD_READ   0x01
@@ -1910,6 +1923,17 @@ index 0000000..5a4266f
 +#define REG_PCH       0xF91
 +#define REG_BSR       0xFE3
 +#define REG_STKPTR    0xFED
++#define REG_TOSL      0xFEE
++#define REG_TOSH      0xFEF
++#define REG_EEADRL    0x191
++#define REG_EEADRH    0x192
++#define REG_EEDATL    0x193
++#define REG_EEDATH    0x194
++#define REG_EECON1    0x195
++#define EECON1_RD     0x01
++#define EECON1_WR     0x02
++#define EECON1_CFGS   0x40
++#define EECON1_EEPGD  0x80
 +#define REG_PCLATH    0x00A
 +#define BREAK_ENABLE  0x80
 +
@@ -1922,14 +1946,15 @@ index 0000000..5a4266f
 +
 +enum pic16f1_reg {
 +	R_PC, R_W, R_STATUS, R_BSR, R_PCLATH, R_FSR0, R_FSR1, R_STKPTR,
-+	NUM_REGS
++	R_COMMON,                        /* 16 registers: common RAM 0x70-0x7F */
++	NUM_REGS = R_COMMON + 16
 +};
 +
 +static const struct {
 +	const char *name;
 +	unsigned int bits;
 +} reg_info[NUM_REGS] = {
-+	[R_PC] = { "pc", 16 },
++	[R_PC] = { "pc", 32 },
 +	[R_W] = { "w", 8 },
 +	[R_STATUS] = { "status", 8 },
 +	[R_BSR] = { "bsr", 8 },
@@ -1937,6 +1962,15 @@ index 0000000..5a4266f
 +	[R_FSR0] = { "fsr0", 16 },
 +	[R_FSR1] = { "fsr1", 16 },
 +	[R_STKPTR] = { "stkptr", 8 },
++	/* the toolchain's compiler registers, DWARF numbers 0-15 */
++	[R_COMMON + 0] = { "r0", 8 }, [R_COMMON + 1] = { "r1", 8 },
++	[R_COMMON + 2] = { "r2", 8 }, [R_COMMON + 3] = { "r3", 8 },
++	[R_COMMON + 4] = { "r4", 8 }, [R_COMMON + 5] = { "r5", 8 },
++	[R_COMMON + 6] = { "r6", 8 }, [R_COMMON + 7] = { "r7", 8 },
++	[R_COMMON + 8] = { "r8", 8 }, [R_COMMON + 9] = { "r9", 8 },
++	[R_COMMON + 10] = { "r10", 8 }, [R_COMMON + 11] = { "r11", 8 },
++	[R_COMMON + 12] = { "r12", 8 }, [R_COMMON + 13] = { "r13", 8 },
++	[R_COMMON + 14] = { "tmp0", 8 }, [R_COMMON + 15] = { "tmp1", 8 },
 +};
 +
 +struct pic16f1_common {
@@ -1945,6 +1979,14 @@ index 0000000..5a4266f
 +	struct breakpoint *bp;       /* the hardware breakpoint, if set */
 +	bool halt_requested;
 +	bool bp_armed;               /* the last resume armed the breakpoint */
++	const struct pic16f1_device *dev;   /* found from the device ID while halted */
++	bool dev_known;
++	/* Program memory words read in this session. Flash does not change
++	 * under a debug session unless the program writes it itself; the
++	 * cache is dropped whenever the part is reprogrammed or contact is
++	 * lost, and by "pic16f1 forget_flash". */
++	uint16_t code[0x8000];
++	uint8_t code_valid[0x8000];
 +};
 +
 +struct pic16f1_reg_arch {
@@ -2057,6 +2099,8 @@ index 0000000..5a4266f
 +	static const uint32_t addrs[] = {
 +		REG_PCL, REG_PCH, SAVE_W, SAVE_STATUS, REG_BSR, REG_PCLATH,
 +		SAVE_FSR0L, SAVE_FSR0H, SAVE_FSR1L, SAVE_FSR1H, REG_STKPTR,
++		0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
++		0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F,
 +	};
 +	uint8_t v[ARRAY_SIZE(addrs)];
 +
@@ -2071,6 +2115,8 @@ index 0000000..5a4266f
 +	reg_store(target, R_FSR0, v[6] | (v[7] << 8));
 +	reg_store(target, R_FSR1, v[8] | (v[9] << 8));
 +	reg_store(target, R_STKPTR, v[10] & 0x1F);
++	for (unsigned int i = 0; i < 16; i++)
++		reg_store(target, R_COMMON + i, v[11 + i]);
 +	return ERROR_OK;
 +}
 +
@@ -2081,7 +2127,7 @@ index 0000000..5a4266f
 +	static const uint32_t addrs[] = { REG_PCL, REG_PCH };
 +
 +	if (r->valid) {
-+		*word_pc = buf_get_u32(r->value, 0, 16) / 2;
++		*word_pc = buf_get_u32(r->value, 0, 32) / 2;
 +		return ERROR_OK;
 +	}
 +	int retval = exec_read_batch(addrs, 2, v);
@@ -2148,7 +2194,10 @@ index 0000000..5a4266f
 +		retval = exec_write8(REG_STKPTR, v & 0x1F);
 +		break;
 +	default:
-+		return ERROR_FAIL;
++		if (a->id < R_COMMON)
++			return ERROR_FAIL;
++		retval = exec_write8(0x70 + (a->id - R_COMMON), v);
++		break;
 +	}
 +	if (retval != ERROR_OK)
 +		return retval;
@@ -2194,7 +2243,8 @@ index 0000000..5a4266f
 +		list[i].number = i;
 +		list[i].reg_data_type = calloc(1, sizeof(struct reg_data_type));
 +		if (list[i].reg_data_type)
-+			list[i].reg_data_type->type = reg_info[i].bits == 16 ? REG_TYPE_UINT16 : REG_TYPE_UINT8;
++			list[i].reg_data_type->type = reg_info[i].bits == 32 ? REG_TYPE_CODE_PTR :
++				reg_info[i].bits == 16 ? REG_TYPE_UINT16 : REG_TYPE_UINT8;
 +		list[i].feature = calloc(1, sizeof(struct reg_feature));
 +		if (list[i].feature)
 +			list[i].feature->name = "org.gnu.gdb.pic16f1.core";
@@ -2235,6 +2285,8 @@ index 0000000..5a4266f
 +	register_cache_invalidate(pic(target)->cache);
 +	target->state = TARGET_UNKNOWN;
 +	pic(target)->bp_armed = false;
++	pic(target)->dev_known = false;
++	memset(pic(target)->code_valid, 0, sizeof(pic(target)->code_valid));
 +}
 +
 +static int pic16f1_poll(struct target *target)
@@ -2561,14 +2613,195 @@ index 0000000..5a4266f
 +	}
 +	if (address < DATA_BASE) {
 +		LOG_ERROR("pic16f1: address 0x%" TARGET_PRIxADDR " is program memory, which cannot "
-+			"be accessed during a debug session; data memory is at 0x%x + address "
-+			"(use 'flash read_bank' for program memory)", address, DATA_BASE);
++			"be written during a debug session; data memory is at 0x%x + address",
++			address, DATA_BASE);
 +		return ERROR_FAIL;
 +	}
 +	if (address - DATA_BASE + bytes > DATA_SPACE) {
-+		LOG_ERROR("pic16f1: data address out of range");
++		LOG_ERROR("pic16f1: data address out of range (the return stack at 0x%x is read only)",
++			STACK_BASE);
 +		return ERROR_FAIL;
 +	}
++	return ERROR_OK;
++}
++
++static int queue_write8(uint32_t addr, uint8_t value)
++{
++	const uint8_t tx[] = { CMD_WRITE, addr & 0xFF, addr >> 8, value };
++	return icsp_icd_queue(tx, sizeof(tx), 0);
++}
++
++static int queue_read8(uint32_t addr)
++{
++	const uint8_t tx[] = { CMD_READ, addr & 0xFF, addr >> 8 };
++	return icsp_icd_queue(tx, sizeof(tx), 1);
++}
++
++/*
++ * Read words of the target's non-volatile memory with its own read
++ * mechanism. The executive's write command is followed by two NOPs for the
++ * two instructions the core skips once RD is set. The user's EEADR, EEDAT
++ * and EECON1 are put back.
++ *
++ * con selects the memory: EEPGD for program memory, EEPGD | CFGS for the
++ * configuration space, 0 for the data EEPROM (one byte per word).
++ */
++static int nvm_read_words(uint8_t con, uint32_t first, unsigned int count, uint16_t *words)
++{
++	static const uint32_t regs[5] = { REG_EEADRL, REG_EEADRH, REG_EEDATL, REG_EEDATH, REG_EECON1 };
++	uint8_t saved[5];
++	int retval = exec_read_batch(regs, 5, saved);
++
++	if (retval != ERROR_OK)
++		return retval;
++	for (unsigned int done = 0; done < count && retval == ERROR_OK;) {
++		unsigned int n = MIN(count - done, 16U);
++		uint8_t v[32];
++
++		for (unsigned int i = 0; i < n && retval == ERROR_OK; i++) {
++			uint32_t a = first + done + i;
++			retval = queue_write8(REG_EEADRL, a & 0xFF);
++			if (retval == ERROR_OK)
++				retval = queue_write8(REG_EEADRH, (a >> 8) & 0x7F);
++			if (retval == ERROR_OK)
++				retval = queue_write8(REG_EECON1, con | EECON1_RD);
++			if (retval == ERROR_OK)
++				retval = queue_read8(REG_EEDATL);
++			if (retval == ERROR_OK)
++				retval = queue_read8(REG_EEDATH);
++		}
++		if (retval != ERROR_OK) {
++			icsp_queue_clear();
++			break;
++		}
++		if (icsp_flush(v, 2 * n) != ERROR_OK)
++			return link_error("program memory read");
++		for (unsigned int i = 0; i < n; i++)
++			words[done + i] = con ? (v[2 * i] | (v[2 * i + 1] & 0x3F) << 8) : v[2 * i];
++		done += n;
++	}
++	for (unsigned int i = 0; i < 4; i++)
++		queue_write8(regs[i], saved[i]);
++	queue_write8(REG_EECON1, saved[4] & ~(EECON1_RD | EECON1_WR));
++	if (icsp_flush(NULL, 0) != ERROR_OK)
++		return link_error("program memory read");
++	return retval;
++}
++
++/* The device, from its ID word in the configuration space. */
++static const struct pic16f1_device *halted_device(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++
++	if (!p->dev_known) {
++		uint16_t id;
++		if (nvm_read_words(EECON1_EEPGD | EECON1_CFGS, 0x0006, 1, &id) != ERROR_OK)
++			return NULL;
++		p->dev = pic16f1_identify(id);
++		p->dev_known = true;
++		if (!p->dev)
++			LOG_WARNING("pic16f1: unknown device ID 0x%04x", id);
++	}
++	return p->dev;
++}
++
++int pic16f1_target_identify(struct target *target, const struct pic16f1_device **dev,
++		uint16_t *dev_word)
++{
++	uint16_t id;
++
++	if (!target || !target->type->name || strcmp(target->type->name, "pic16f1") ||
++			target->state != TARGET_HALTED)
++		return ERROR_TARGET_NOT_HALTED;
++	if (nvm_read_words(EECON1_EEPGD | EECON1_CFGS, 0x0006, 1, &id) != ERROR_OK)
++		return ERROR_FAIL;
++	*dev = pic16f1_identify(id);
++	if (!*dev)
++		return ERROR_FAIL;
++	pic(target)->dev = *dev;
++	pic(target)->dev_known = true;
++	if (dev_word)
++		*dev_word = id;
++	return ERROR_OK;
++}
++
++/* Program memory, configuration space and EEPROM at their HEX file addresses */
++static int read_code_space(struct target *target, uint32_t address, uint32_t total, uint8_t *buffer)
++{
++	const struct pic16f1_device *dev = halted_device(target);
++	uint32_t flash_bytes = 2 * (dev ? dev->flash_words : 0x8000);
++	uint32_t ee_bytes = 2 * (dev ? dev->eeprom : PIC16F1_MAX_EEPROM);
++	uint32_t base, limit;
++	uint8_t con;
++
++	if (address < flash_bytes) {
++		base = PIC16F1_BASE_FLASH; limit = flash_bytes; con = EECON1_EEPGD;
++	} else if (address >= PIC16F1_BASE_CONFIG &&
++			address < PIC16F1_BASE_CONFIG + 2 * PIC16F1_CONFIG_SPACE_WORDS) {
++		base = PIC16F1_BASE_CONFIG; limit = 2 * PIC16F1_CONFIG_SPACE_WORDS;
++		con = EECON1_EEPGD | EECON1_CFGS;
++	} else if (address >= PIC16F1_BASE_EEPROM && address < PIC16F1_BASE_EEPROM + ee_bytes) {
++		base = PIC16F1_BASE_EEPROM; limit = ee_bytes; con = 0;
++	} else {
++		LOG_ERROR("pic16f1: nothing to read at address 0x%" PRIx32, address);
++		return ERROR_FAIL;
++	}
++	if (address - base + total > limit) {
++		LOG_ERROR("pic16f1: read of %" PRIu32 " bytes at 0x%" PRIx32 " runs past the end of "
++			"the region", total, address);
++		return ERROR_FAIL;
++	}
++
++	uint32_t first = (address - base) / 2;
++	uint32_t nwords = (address - base + total + 1) / 2 - first;
++	uint16_t *words = malloc(nwords * sizeof(uint16_t));
++	if (!words)
++		return ERROR_FAIL;
++	int retval = ERROR_OK;
++	if (con == EECON1_EEPGD) {
++		/* program memory: read the runs that are not cached yet */
++		struct pic16f1_common *p = pic(target);
++		for (uint32_t i = 0; i < nwords && retval == ERROR_OK;) {
++			uint32_t run = 0;
++			while (i + run < nwords && !p->code_valid[first + i + run])
++				run++;
++			if (run) {
++				retval = nvm_read_words(con, first + i, run, &p->code[first + i]);
++				if (retval == ERROR_OK)
++					memset(&p->code_valid[first + i], 1, run);
++			}
++			i += run + 1;
++		}
++		memcpy(words, &p->code[first], nwords * sizeof(uint16_t));
++	} else {
++		retval = nvm_read_words(con, first, nwords, words);
++	}
++	for (uint32_t i = 0; retval == ERROR_OK && i < total; i++) {
++		uint32_t off = address - base + i;
++		uint16_t w = words[off / 2 - first];
++		buffer[i] = (off & 1) ? w >> 8 : w & 0xFF;
++	}
++	free(words);
++	return retval;
++}
++
++/* The hardware return stack: point STKPTR at each level and read TOSH:TOSL */
++static int read_return_stack(uint32_t offset, uint32_t total, uint8_t *buffer)
++{
++	uint8_t sp, v[2 * STACK_LEVELS];
++	int retval = exec_read8(REG_STKPTR, &sp);
++
++	if (retval != ERROR_OK)
++		return retval;
++	for (unsigned int level = 0; level < STACK_LEVELS; level++) {
++		queue_write8(REG_STKPTR, level);
++		queue_read8(REG_TOSL);
++		queue_read8(REG_TOSH);
++	}
++	queue_write8(REG_STKPTR, sp);
++	if (icsp_flush(v, sizeof(v)) != ERROR_OK)
++		return link_error("return stack read");
++	memcpy(buffer, v + offset, total);
 +	return ERROR_OK;
 +}
 +
@@ -2576,6 +2809,21 @@ index 0000000..5a4266f
 +		uint32_t size, uint32_t count, uint8_t *buffer)
 +{
 +	uint32_t total = size * count;
++
++	if (target->state != TARGET_HALTED) {
++		LOG_ERROR("pic16f1: target not halted");
++		return ERROR_TARGET_NOT_HALTED;
++	}
++	if (address < DATA_BASE)
++		return read_code_space(target, address, total, buffer);
++	if (address >= STACK_BASE) {
++		if (address - STACK_BASE + total > 2 * STACK_LEVELS) {
++			LOG_ERROR("pic16f1: the return stack is %d bytes at 0x%x", 2 * STACK_LEVELS, STACK_BASE);
++			return ERROR_FAIL;
++		}
++		return read_return_stack(address - STACK_BASE, total, buffer);
++	}
++
 +	int retval = check_data_access(target, address, total);
 +	if (retval != ERROR_OK)
 +		return retval;
@@ -2665,7 +2913,7 @@ index 0000000..5a4266f
 +	/* cached copies of core registers may have changed */
 +	for (uint32_t i = 0; i < total; i++) {
 +		uint32_t a = base + i;
-+		if ((a < 0x1000 && (a & 0x7F) < 0x0C) || (a >= 0x320 && a < 0x330) ||
++		if ((a < 0x1000 && ((a & 0x7F) < 0x0C || (a & 0x7F) >= 0x70)) || (a >= 0x320 && a < 0x330) ||
 +				a == REG_PCL || a == REG_PCH || a == REG_BSR || a == REG_STKPTR) {
 +			register_cache_invalidate(pic(target)->cache);
 +			if (read_all_regs(target) != ERROR_OK)
@@ -2847,10 +3095,10 @@ index 0000000..5a4266f
 +	struct target *target = get_current_target(CMD_CTX);
 +	struct image image;
 +
-+	if (CMD_ARGC != 1)
++	if (CMD_ARGC < 1 || CMD_ARGC > 2)
 +		return ERROR_COMMAND_SYNTAX_ERROR;
 +
-+	int retval = image_open(&image, CMD_ARGV[0], "ihex");
++	int retval = image_open(&image, CMD_ARGV[0], CMD_ARGC > 1 ? CMD_ARGV[1] : NULL);
 +	if (retval != ERROR_OK)
 +		return retval;
 +
@@ -2876,6 +3124,16 @@ index 0000000..5a4266f
 +	}
 +	command_print(CMD, "target programmed for debugging, state: %s",
 +		target_state_name(target));
++	return ERROR_OK;
++}
++
++COMMAND_HANDLER(handle_pic16f1_forget_flash_command)
++{
++	struct target *target = get_current_target(CMD_CTX);
++
++	if (CMD_ARGC != 0)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++	memset(pic(target)->code_valid, 0, sizeof(pic(target)->code_valid));
 +	return ERROR_OK;
 +}
 +
@@ -2908,10 +3166,17 @@ index 0000000..5a4266f
 +		.name = "load_debug",
 +		.handler = handle_pic16f1_load_debug_command,
 +		.mode = COMMAND_EXEC,
-+		.help = "bulk erase, program an Intel HEX image together with the debug "
++		.help = "bulk erase, program an image (Intel HEX or ELF) together with the debug "
 +			"executive and DEBUG enabled, release reset; the target ends halted "
 +			"at the reset vector",
-+		.usage = "hexfile",
++		.usage = "file [type]",
++	},
++	{
++		.name = "forget_flash",
++		.handler = handle_pic16f1_forget_flash_command,
++		.mode = COMMAND_EXEC,
++		.help = "drop the program memory read so far, after the program has written flash itself",
++		.usage = "",
 +	},
 +	{
 +		.name = "unload_debug",
@@ -2995,7 +3260,7 @@ index 0000000..5a4266f
 +	if (target->state == TARGET_HALTED && pc->valid)
 +		LOG_USER("target halted due to %s, pc 0x%04" PRIx32 " (word address 0x%04" PRIx32 ")",
 +			debug_reason_name(target),
-+			buf_get_u32(pc->value, 0, 16), buf_get_u32(pc->value, 0, 16) / 2);
++			buf_get_u32(pc->value, 0, 32), buf_get_u32(pc->value, 0, 32) / 2);
 +	return ERROR_OK;
 +}
 +
@@ -3535,10 +3800,10 @@ index 0000000..3cca4e9
 +}
 diff --git a/src/target/pic16f1_icsp.h b/src/target/pic16f1_icsp.h
 new file mode 100644
-index 0000000..24d6a79
+index 0000000..1717aea
 --- /dev/null
 +++ b/src/target/pic16f1_icsp.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,126 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +
 +/*
@@ -3656,6 +3921,14 @@ index 0000000..24d6a79
 + */
 +void pic16f1_target_link_lost(struct target *target);
 +
++/**
++ * Identify the device of a target halted in a debug session, by reading its
++ * device ID through the debug executive. Unlike pic16f1_connect() this does
++ * not reset the target. Fails if the target is not halted.
++ */
++int pic16f1_target_identify(struct target *target, const struct pic16f1_device **dev,
++		uint16_t *dev_word);
++
 +#endif /* OPENOCD_TARGET_PIC16F1_ICSP_H */
 diff --git a/src/target/target.c b/src/target/target.c
 index e3a6f95..5a2f319 100644
@@ -3718,10 +3991,10 @@ index 0000000..bfd3e08
 +adapter speed 100
 diff --git a/tcl/target/pic16f193x.cfg b/tcl/target/pic16f193x.cfg
 new file mode 100644
-index 0000000..4f18859
+index 0000000..8dba833
 --- /dev/null
 +++ b/tcl/target/pic16f193x.cfg
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,46 @@
 +# SPDX-License-Identifier: GPL-2.0-or-later
 +
 +#
@@ -3730,7 +4003,8 @@ index 0000000..4f18859
 +#
 +# Address convention: code addresses are byte addresses as in HEX files
 +# (2 * word address), program flash at 0; data memory is at 0x800000 + the
-+# data address (register file 0x000-0xFFF, linear 0x2000 and up).
++# data address (register file 0x000-0xFFF, linear 0x2000 and up); the
++# hardware return stack is at 0x810000 (16 slots of 2 bytes, word addresses).
 +#
 +# Variables: CHIPNAME. The flash banks are sized by the probe.
 +#
@@ -3758,5 +4032,12 @@ index 0000000..4f18859
 +# Make gdb's software breakpoint requests use it.
 +gdb_breakpoint_override hard
 +
++# A register write that fails (the program counter cannot be written) is
++# reported to the debugger instead of being acknowledged.
++gdb_report_register_access_error enable
++
 +# There is no srst; reset is done by the target driver
 +reset_config none
++
++# A debugger that connects finds the target halted
++$_TARGETNAME configure -event gdb-attach { halt 1000 }

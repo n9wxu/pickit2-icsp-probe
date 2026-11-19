@@ -1,0 +1,4 @@
+halted at PC=0083
+STKPTR=02  stack: 0021 0041 0061 0080 2200 0000 7FFF 7FFF 7EFF 3EFF 0000 0044 0400 0A01 7EFF 7FEF
+read again: same, STKPTR=02
+after release: PC=0082 STKPTR=02, returns to main counted: 1

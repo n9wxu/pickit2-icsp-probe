@@ -1,0 +1,35 @@
+user registers before: 00 80 00 00 00
+   0000: read 0000, image 0000
+   0001: read 3180, image 3180
+   0002: read 2820, image 2820
+   0003: read 3FFF, image 3FFF
+   0004: read 0009, image 0009
+   0005: read 3FFF, image 3FFF
+   0006: read 3FFF, image 3FFF
+   0007: read 3FFF, image 3FFF
+   0020: read 2040, image 2040
+   0021: read 0AF2, image 0AF2
+   0022: read 2820, image 2820
+   0023: read 3FFF, image 3FFF
+   0040: read 2060, image 2060
+   0041: read 0008, image 0008
+   0080: read 0AF1, image 0AF1
+   0081: read 08F0, image 08F0
+   0082: read 1903, image 1903
+   0083: read 2880, image 2880
+   0084: read 01F0, image 01F0
+   0085: read 0008, image 0008
+   0086: read 3FFF, image 3FFF
+   0100: read 3FFF, image 3FFF
+   1FFF: read 3FFF, image 3FFF
+program memory: all match
+configuration space (CFGS):
+   8000: 3FFF
+   8004: 2810
+   8006: 2482
+   8007: 09C4
+   8008: 2EFF
+   8010: 0000
+   8011: 0000
+user registers after:  00 80 00 00 00
+still steps: PC=0020

@@ -40,6 +40,7 @@ Debugging supports the PIC16(L)F193x only.
 | `docs/releasing.md` | How a release is made |
 | `tools/sds.py` | SCPI helper for a Siglent SDS1000X-E oscilloscope |
 | `test/blink/` | Test program for the F1 Evaluation Platform |
+| `test/calls/` | Three nested calls, for testing return stack reads |
 | `backup/` | Not in the repository. `pk2boot.py backup` saves your PICkit 2's original firmware here |
 
 ## Setup

@@ -75,17 +75,29 @@ released and the boost converter stopped; target power is left on unless `power_
 
 | Command | Meaning |
 |---|---|
-| `pic16f1 load_debug <hex>` | What `Debugger.load` does: bulk erase, program flash/EEPROM/user IDs of the image, the debug executive (0x8004, 0x8010-0x8088), configuration words with DEBUG enabled, verify, release reset. The target ends halted at the reset vector. |
+| `pic16f1 load_debug <file> [type]` | Intel HEX or ELF, detected from the file. What `Debugger.load` does: bulk erase, program flash/EEPROM/user IDs of the image, the debug executive (0x8004, 0x8010-0x8088), configuration words with DEBUG enabled, verify, release reset. The target ends halted at the reset vector. |
 | `pic16f1 unload_debug` | What `Debugger.unload` does: bulk erase and erase the executive rows 0x8020-0x80FF. The device is blank afterwards (it keeps running, power stays on). |
+
+| `pic16f1 forget_flash` | Drop the program memory read so far in this session. Only needed after the program has written its own flash. |
 
 Standard commands that work: `halt`, `resume`, `step`, `reset halt|run|init`, `reg`, `reg <name> [value]`, `bp <addr> 2 hw`,
 `rbp`, `mdb/mdh/mdw/mwb/...`, `targets`, `poll`, and over gdb-remote the generic register and memory packets.
 
 ### Registers
 
-`pc`, `w`, `status`, `bsr`, `pclath`, `fsr0`, `fsr1`, `stkptr` (all read while halted). All can be written except
-`pc`, which fails with `the program counter of a halted target cannot be changed` (the hardware has no way to set it).
-The register values are cached on every halt (about 120 ms for the batch of reads).
+In `g` packet order, as agreed with the toolchain's LLDB work:
+
+| Number | Name | Bits | Content |
+|---|---|---|---|
+| 0 | `pc` | 32 | Byte address of the next instruction (2 x word PC). Read only |
+| 1-4 | `w`, `status`, `bsr`, `pclath` | 8 | |
+| 5, 6 | `fsr0`, `fsr1` | 16 | |
+| 7 | `stkptr` | 8 | 0x1F when the return stack is empty |
+| 8-21 | `r0`-`r13` | 8 | Common RAM 0x70-0x7D, the compiler's registers |
+| 22, 23 | `tmp0`, `tmp1` | 8 | Common RAM 0x7E, 0x7F |
+
+All can be written except `pc`: the hardware has no way to set it, and the write fails with an error (over gdb-remote
+too, an `E` reply to `P`). The values are read once on every halt, 27 bytes in one batch.
 
 ### Address convention
 
@@ -95,9 +107,45 @@ The register values are cached on every halt (about 120 ms for the batch of read
   (bank x 0x80 + offset) or a linear address 0x2000 and up. Core registers are translated to where the executive keeps
   the user's values exactly as `Debugger._map/read_data/write_data` do (`STATUS`, `PCL`, `FSR`, `BSR`, `W`).
   Example: `mdb 0x800070 2` reads RAM 0x70-0x71; `mdb 0x80010f 2` reads LATD/LATE.
-- **Program memory cannot be read during a debug session** (reads below 0x800000 fail with an explanatory error).
-  `flash read_bank` and `flash verify_image` can: they use a programming session, which resets the target (see below).
-- Data memory accesses are one byte per executive command (about 2.5 ms per byte over the link, batched in the probe).
+- **Flash through the data space**: 0x808000 and up is program memory as an FSR sees it, the low 8 bits of each word,
+  one byte per word.
+- **The hardware return stack is at 0x810000**: 16 slots of two bytes, little endian, slot `n` at 0x810000 + 2n. Each
+  holds the word address the silicon keeps (not doubled). Slot `stkptr` is the top of the stack. Read only.
+- **Program memory can be read from a halted target** at its code address, two bytes per word. So can the configuration
+  space at 0x10000 (user IDs, device ID at 0x1000C, configuration words at 0x1000E) and the data EEPROM at 0x1E000
+  (one word per byte). The driver has the part read its own memory through `EEADR`/`EECON1`/`EEDAT` and puts the
+  user's values of those registers back. Words read are kept until the part is reprogrammed or contact is lost
+  (`pic16f1 forget_flash` drops them). The executive's own words at 0x8010 and up read as zero this way. None of
+  this can be written during a debug session.
+- Data memory accesses are one byte per executive command. See "Speed" below.
+
+### What a debugger sees over gdb-remote
+
+Checked with raw packets on the PIC16LF1937 (the list the toolchain's LLDB plugin will use): `qSupported`,
+`qXfer:features:read` (target.xml, feature `org.gnu.gdb.pic16f1.core`), `qXfer:memory-map:read`, `?`, `g`, `p`/`P`,
+`m`/`M`, `c`, `s`, `vCont` with `c` and `s`, `Z`/`z`, interrupt (0x03), `D`.
+
+- Connecting halts the target (`gdb-attach` event in the config file). Probing the flash banks for the memory map
+  goes through the debug link when the target is halted, so connecting does not reset it.
+- `Z0` and `Z1` both use the one hardware breakpoint. A second breakpoint gets an `E` reply.
+- A stop is reported with the true pc: after a breakpoint that is the instruction after the breakpoint address.
+- There is no thread list (`qfThreadInfo` answers `l`) and no `qHostInfo`; stop replies are `T05` without a thread.
+
+### Speed
+
+The link is clocked by the target, so it follows the target's oscillator. Measured on the test board at 500 kHz
+(the part's default internal oscillator), where one instruction takes 8 us:
+
+| Operation | Time |
+|---|---|
+| Halt and read all registers | 300 ms |
+| Single step, registers read | 325 ms |
+| Read 16 bytes of data memory | 175 ms (11 ms per byte) |
+| Read program memory, first time | 55 ms per word |
+| Read the return stack | 550 ms |
+
+A program that switches to a faster oscillator shortens the bit times in proportion; an 800 us handshake per byte
+remains, which sets a floor near 3 ms per byte of data memory.
 
 ### Breakpoint skid
 
@@ -152,16 +200,16 @@ verified 5170 bytes from file test/blink/blink.hex in 0.558765s (9.036 KiB/s)
 > pic16f1 load_debug test/blink/blink.hex
 target programmed for debugging, state: halted
 > reg
-(0) pc (/16): 0x0002
+(0) pc (/32): 0x00000002
 (1) w (/8): 0x00
 ...
 > step
 > reg pc
-pc (/16): 0x0004
+pc (/32): 0x00000004
 > resume
 > halt
 > reg pc
-pc (/16): 0x0ff0
+pc (/32): 0x00000ff0
 > bp 0xff2 2 hw
 > resume
 > mdb 0x800070 4
@@ -177,15 +225,15 @@ pc (/16): 0x0ff0
 - One hardware breakpoint; it halts after the instruction. No software breakpoints (the pc cannot be changed, so they
   cannot be made transparent), no watchpoints.
 - The pc cannot be written. `resume`/`step` at an address fail.
-- Program memory cannot be read while debugging (use a programming session); `verify_image` (target command) and
-  `dump_image` of code addresses do not work, use `flash verify_image` / `flash read_bank`.
+- Program memory is read-only while debugging, and slow to read at a low target clock (see "Speed").
+- ELF input to `load_debug` goes through OpenOCD's ELF loader and has not been tried; only HEX files were used.
 - Erase is a bulk erase of the whole device (no sector or row erase). Config words can only be rewritten after a bulk erase.
 - Programming mode entry resets the target and ends any debug session. The device is not code-protected-aware: with code protection
   enabled reads return zeros and verification fails.
 - `reset` resumes the target and then pulses MCLR. If MCLR is configured as a digital input (MCLRE = 0) the
   pulse has no effect and the target is power cycled instead, which needs `pk2icsp power on`. A self-powered
   target with MCLRE = 0 cannot be reset.
-- Register and memory access over the executive link is slow (about 10 ms per byte read); registers are read once per halt.
+- Register and memory access over the executive link is slow at a low target clock (see "Speed").
 - The USB device is found by VID:PID and the vendor interface class; the stock PICkit 2 firmware (HID) is not usable.
   Only one probe is expected (`adapter serial` is honoured but not tested).
 - Tested only on macOS (Apple Silicon, libusb 1.0.30). Not tested: `pk2icsp power off` (self-powered target),

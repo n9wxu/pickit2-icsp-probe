@@ -145,8 +145,9 @@ The host does the rest by reading and writing memory.
   below. The debugger does not implement them.
 - The single-step bit in 0xF8E is not used yet. Stepping still borrows the
   hardware breakpoint.
-- Program memory is not read from the target during a session. The host
-  keeps the image it programmed.
+- Program memory can be read from a halted target but not written (D13).
+  The Python debugger still answers from the image it programmed; the
+  OpenOCD target reads the part.
 - The executive needs about 2.5 ms per byte at the 500 kHz reset clock, so a
   register read takes about 10 ms.
 - `DEBUG` enabled means ICSPCLK and ICSPDAT belong to the debugger.
@@ -717,6 +718,60 @@ worked because it is slower. Both now wait 10 ms between the resume and the
 pulse. With that, three resets in a row through OpenOCD stopped at the reset
 vector with no power cycle.
 
+## Phase 8: what a source-level debugger needs
+
+The toolchain's LLDB needs two things the debugger did not have: the
+hardware return stack, for backtraces, and program memory. Both scripts
+use a small program with three nested calls (`test/calls/calls.hex` is the
+same program as a HEX file).
+
+### D12. Reading the return stack
+
+`STKPTR` (0xFED) selects which entry `TOSH:TOSL` (0xFEF:0xFEE) shows. The
+script halts inside the innermost function, writes each level 0–15 to
+`STKPTR`, reads the entry, and puts `STKPTR` back.
+
+```
+halted at PC=0083
+STKPTR=02  stack: 0021 0041 0061 0080 2200 0000 7FFF ...
+read again: same, STKPTR=02
+after release: PC=0082 STKPTR=02, returns to main counted: 1
+```
+
+Levels 0–2 are the three return addresses. The levels above `STKPTR` hold
+whatever was left there. Reading is repeatable, and the program afterwards
+returned through all three frames to `main`, so the walk disturbs nothing.
+The executive's own `CALL`s do not show up, which agrees with D11: calls
+made in debug mode do not use the user's stack.
+
+### D13. Reading program memory
+
+Earlier phases assumed program memory could not be read in a session. The
+part can read its own flash: address in `EEADRH:EEADRL`, set `EEPGD` and
+`RD` in `EECON1`, result in `EEDATH:EEDATL`. The core skips the two
+instructions after the one that sets `RD`; the executive's write command
+already ends in two `NOP`s for that reason. So three ordinary write
+commands and two reads fetch a word.
+
+- 23 words of program memory, programmed and blank, all matched the image.
+- With `CFGS` also set the configuration space reads: 0x8004 `2810` (the
+  debug vector), 0x8006 `2482` (device ID), 0x8007 `09C4`, 0x8008 `2EFF`
+  (`DEBUG` enabled).
+- 0x8010 and 0x8011, the first words of the executive, read `0000` this
+  way although they are programmed. The executive area is not readable
+  from inside.
+- The five registers were restored and the target still stepped.
+
+With `EEPGD` clear the same sequence reads the data EEPROM. The OpenOCD
+target uses all three, and also identifies the device from 0x8006 so that
+connecting a debugger does not need programming mode, which would reset
+the target.
+
+The same registers are how a program writes its own flash. That needs the
+0x55, 0xAA unlock sequence in consecutive instructions, which cannot be
+done with separate write commands; it would take a routine in the
+executive. Not tried.
+
 ## Mistakes and corrections
 
 | What | Where | How it was caught |
@@ -732,6 +787,7 @@ vector with no power cycle.
 | Probe firmware raised a false power fault during debug traffic | D1 | Fixed in `firmware/power.c` |
 | Reset pulsed MCLR before the executive had left debug mode | D8, OpenOCD port | The port fell back to a power cycle every time; a delay was added |
 | Only two windows of the register space examined | X2, X3 | Whole data space scanned in D9 and D10 |
+| Program memory assumed unreadable during a session | D1 onward | D13: the part's own flash read works from the executive |
 
 ## Open questions
 

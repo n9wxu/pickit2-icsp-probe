@@ -1,8 +1,8 @@
 # ICD experiment scripts
 
 These are the scripts behind the development record in
-[docs/icd.md](../../docs/icd.md), kept as they were run on 2026-11-18. The
-names match the experiment numbers there (`e0`–`e10`, `x1`–`x6`, `d1`–`d11`).
+[docs/icd.md](../../docs/icd.md), kept as they were run on 2026-11-18 and 2026-11-19. The
+names match the experiment numbers there (`e0`–`e10`, `x1`–`x6`, `d1`–`d13`).
 
 They are a record, not maintained code.
 
@@ -15,7 +15,7 @@ They are a record, not maintained code.
   (a PC setter that never worked, and the earlier `reset()`).
 - `d11.py` needs an executive command (`CMD_RETURN`) that was added for that
   experiment and removed again.
-- `d9.out`, `d10.out` and `d11.out` are the saved output of those runs.
+- `d9.out` to `d13.out` are the saved output of those runs.
 - They assume a PIC16LF1937 powered by the probe at 3.3 V. Several of them
   write the debug space at 0x8004–0x80FF. None writes 0x8100 or above.
 
