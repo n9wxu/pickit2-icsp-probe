@@ -422,6 +422,7 @@ class Debugger:
         if not self.halted():
             self.halt()
         self.resume(breakpoint=0)
+        p.delay_ms(10)                  # let the executive leave debug mode first
         p.mclr(MCLR_GROUND)
         p.delay_ms(2)
         p.pins(PINS_IDLE)

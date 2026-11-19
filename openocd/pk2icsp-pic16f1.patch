@@ -1,0 +1,3762 @@
+diff --git a/configure.ac b/configure.ac
+index eee42d4..a510191 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -128,7 +128,8 @@ m4_define([USB1_ADAPTERS],
+ 	[[armjtagew], [Olimex ARM-JTAG-EW Programmer], [ARMJTAGEW]],
+ 	[[rlink], [Raisonance RLink JTAG Programmer], [RLINK]],
+ 	[[usbprog], [USBProg JTAG Programmer], [USBPROG]],
+-	[[esp_usb_jtag], [Espressif JTAG Programmer], [ESP_USB_JTAG]]])
++	[[esp_usb_jtag], [Espressif JTAG Programmer], [ESP_USB_JTAG]],
++	[[pk2icsp], [PICkit 2 ICSP probe (PIC16F1)], [PK2ICSP]]])
+ 
+ m4_define([DEPRECATED_USB1_ADAPTERS],
+ 	[[[aice], [Andes JTAG Programmer (deprecated)], [AICE]]])
+diff --git a/src/flash/nor/Makefile.am b/src/flash/nor/Makefile.am
+index f04f0d2..b606716 100644
+--- a/src/flash/nor/Makefile.am
++++ b/src/flash/nor/Makefile.am
+@@ -50,6 +50,7 @@ NOR_DRIVERS = \
+ 	%D%/nrf5.c \
+ 	%D%/numicro.c \
+ 	%D%/ocl.c \
++	%D%/pic16f1.c \
+ 	%D%/pic32mx.c \
+ 	%D%/psoc4.c \
+ 	%D%/psoc5lp.c \
+diff --git a/src/flash/nor/drivers.c b/src/flash/nor/drivers.c
+index b9353d8..e760a3f 100644
+--- a/src/flash/nor/drivers.c
++++ b/src/flash/nor/drivers.c
+@@ -50,6 +50,7 @@ extern const struct flash_driver nrf5_flash;
+ extern const struct flash_driver nrf51_flash;
+ extern const struct flash_driver numicro_flash;
+ extern const struct flash_driver ocl_flash;
++extern const struct flash_driver pic16f1_flash;
+ extern const struct flash_driver pic32mx_flash;
+ extern const struct flash_driver psoc4_flash;
+ extern const struct flash_driver psoc5lp_flash;
+@@ -126,6 +127,7 @@ static const struct flash_driver * const flash_drivers[] = {
+ 	&nrf51_flash,
+ 	&numicro_flash,
+ 	&ocl_flash,
++	&pic16f1_flash,
+ 	&pic32mx_flash,
+ 	&psoc4_flash,
+ 	&psoc5lp_flash,
+diff --git a/src/flash/nor/pic16f1.c b/src/flash/nor/pic16f1.c
+new file mode 100644
+index 0000000..04bf8ae
+--- /dev/null
++++ b/src/flash/nor/pic16f1.c
+@@ -0,0 +1,567 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++/*
++ * Flash driver for Microchip PIC16F1 devices with 6 bit ICSP commands
++ * (PIC16(L)F193x), through the icsp transport.
++ *
++ * A device is described by three banks, selected by their base address,
++ * which is the byte address in an Intel HEX file (word address * 2):
++ *
++ *   base 0x00000  program flash        (size is set by the probe, 2 * words)
++ *   base 0x10000  user IDs and configuration words (word space 0x8000-0x800F)
++ *   base 0x1E000  data EEPROM          (HEX word address 0xF000+; one byte per
++ *                                       word, in the low byte)
++ *
++ *   flash bank f.flash  pic16f1 0x00000 0 0 0 $_TARGETNAME
++ *   flash bank f.config pic16f1 0x10000 0 0 0 $_TARGETNAME
++ *   flash bank f.eeprom pic16f1 0x1E000 0 0 0 $_TARGETNAME
++ *
++ * Erasing: the device is bulk erased, there is no sector erase. The program
++ * flash bank has a single sector, and erasing it (erase_sector, erase_address,
++ * write_image erase) bulk erases program memory, the user IDs, the
++ * configuration words and the data EEPROM. The calibration words are not
++ * touched. Erasing the EEPROM bank erases the data EEPROM only. The
++ * configuration bank cannot be erased on its own: erasing it does nothing
++ * (it is erased by the program flash bank, which comes first in an image).
++ *
++ * Every operation enters programming mode, which resets the target, and
++ * leaves the target running with its power on. A debug session is lost.
++ *
++ * Programming the configuration words: an image that would enable DEBUG is
++ * refused (use "pic16f1 load_debug"), because a part with DEBUG enabled and
++ * no debug executive does not run.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "imp.h"
++#include <helper/binarybuffer.h>
++#include <target/target.h>
++#include <target/pic16f1_icsp.h>
++
++enum pic16f1_role {
++	ROLE_FLASH,
++	ROLE_CONFIG,
++	ROLE_EEPROM,
++};
++
++struct pic16f1_bank {
++	enum pic16f1_role role;
++	bool probed;
++};
++
++/* One device, shared by the banks, so that only one probe is needed */
++static const struct pic16f1_device *probed_device;
++static uint16_t probed_rev;
++
++static int session_begin(struct flash_bank *bank, const struct pic16f1_device **dev)
++{
++	int retval = pic16f1_connect(dev, NULL, NULL);
++	if (retval != ERROR_OK)
++		return retval;
++	if (probed_device && *dev != probed_device) {
++		LOG_ERROR("pic16f1: the device is %s, but %s was probed; run 'flash probe'",
++			(*dev)->name, probed_device->name);
++		pic16f1_disconnect();
++		return ERROR_FAIL;
++	}
++	return ERROR_OK;
++}
++
++static int session_end(struct flash_bank *bank)
++{
++	int retval = pic16f1_disconnect();
++	pic16f1_target_link_lost(bank->target);
++	return retval;
++}
++
++FLASH_BANK_COMMAND_HANDLER(pic16f1_flash_bank_command)
++{
++	struct pic16f1_bank *b;
++
++	if (CMD_ARGC < 6)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	b = calloc(1, sizeof(*b));
++	if (!b)
++		return ERROR_FAIL;
++	switch (bank->base) {
++	case PIC16F1_BASE_FLASH:
++		b->role = ROLE_FLASH;
++		break;
++	case PIC16F1_BASE_CONFIG:
++		b->role = ROLE_CONFIG;
++		break;
++	case PIC16F1_BASE_EEPROM:
++		b->role = ROLE_EEPROM;
++		break;
++	default:
++		LOG_ERROR("pic16f1: bank base must be 0x0 (flash), 0x10000 (user IDs and "
++			"configuration) or 0x1E000 (EEPROM)");
++		free(b);
++		return ERROR_FAIL;
++	}
++	bank->driver_priv = b;
++	return ERROR_OK;
++}
++
++static void set_geometry(struct flash_bank *bank, const struct pic16f1_device *dev)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	uint32_t size = 0;
++
++	switch (b->role) {
++	case ROLE_FLASH:
++		size = dev->flash_words * 2;
++		bank->write_start_alignment = bank->write_end_alignment = dev->latches * 2;
++		break;
++	case ROLE_CONFIG:
++		size = PIC16F1_CONFIG_SPACE_WORDS * 2;
++		bank->write_start_alignment = bank->write_end_alignment = 2;
++		break;
++	case ROLE_EEPROM:
++		size = dev->eeprom * 2;
++		bank->write_start_alignment = bank->write_end_alignment = 2;
++		break;
++	}
++	free(bank->sectors);
++	bank->sectors = NULL;
++	bank->num_sectors = 0;
++	bank->size = size;
++	if (size) {
++		bank->sectors = alloc_block_array(0, size, 1);
++		if (!bank->sectors)
++			return;
++		bank->num_sectors = 1;
++	}
++	bank->bus_width = 2;
++	bank->chip_width = 2;
++}
++
++static int pic16f1_probe(struct flash_bank *bank)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	const struct pic16f1_device *dev;
++	uint16_t rev, devw;
++
++	b->probed = false;
++	int retval = pic16f1_connect(&dev, &rev, &devw);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = session_end(bank);
++	if (retval != ERROR_OK)
++		return retval;
++
++	probed_device = dev;
++	probed_rev = devw & ~dev->id_mask & 0x3FFF;
++	LOG_INFO("pic16f1: %s, device ID 0x%04x, revision %u, %" PRIu32 " words of flash, %u bytes of EEPROM",
++		dev->name, devw & dev->id_mask, devw & ~dev->id_mask & 0x3FFF,
++		dev->flash_words, dev->eeprom);
++	set_geometry(bank, dev);
++	b->probed = true;
++	return ERROR_OK;
++}
++
++static int pic16f1_auto_probe(struct flash_bank *bank)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++
++	if (b->probed)
++		return ERROR_OK;
++	if (probed_device) {
++		set_geometry(bank, probed_device);
++		b->probed = true;
++		return ERROR_OK;
++	}
++	return pic16f1_probe(bank);
++}
++
++/* ---- Reading --------------------------------------------------------------------- */
++
++/* Read the words covering the byte range, return them as little endian bytes. */
++static int read_range(struct flash_bank *bank, const struct pic16f1_device *dev,
++		uint8_t *buffer, uint32_t offset, uint32_t count)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	uint32_t first = offset / 2;
++	uint32_t last = (offset + count + 1) / 2;   /* exclusive */
++	uint32_t nwords = last - first;
++	uint16_t *words = calloc(nwords ? nwords : 1, sizeof(uint16_t));
++	uint8_t *bytes = malloc(2 * nwords + 1);
++	int retval = ERROR_OK;
++
++	if (!words || !bytes) {
++		free(words);
++		free(bytes);
++		return ERROR_FAIL;
++	}
++	switch (b->role) {
++	case ROLE_FLASH:
++		retval = pic16f1_read_words(first, nwords, words);
++		break;
++	case ROLE_CONFIG:
++		retval = pic16f1_read_words(0x8000 + first, nwords, words);
++		break;
++	case ROLE_EEPROM: {
++		uint8_t ee[PIC16F1_MAX_EEPROM];
++		retval = pic16f1_read_eeprom(dev->eeprom, ee);
++		for (uint32_t i = 0; retval == ERROR_OK && i < nwords; i++)
++			words[i] = ee[first + i];
++		break;
++	}
++	}
++	if (retval == ERROR_OK) {
++		pic16f1_words_to_bytes(words, nwords, bytes);
++		memcpy(buffer, bytes + (offset & 1), count);
++	}
++	free(words);
++	free(bytes);
++	return retval;
++}
++
++static int pic16f1_read(struct flash_bank *bank, uint8_t *buffer, uint32_t offset, uint32_t count)
++{
++	const struct pic16f1_device *dev;
++
++	int retval = pic16f1_auto_probe(bank);
++	if (retval != ERROR_OK)
++		return retval;
++	if (offset + count > bank->size) {
++		LOG_ERROR("pic16f1: read beyond the end of the bank");
++		return ERROR_FAIL;
++	}
++	retval = session_begin(bank, &dev);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = read_range(bank, dev, buffer, offset, count);
++	int r2 = session_end(bank);
++	return retval != ERROR_OK ? retval : r2;
++}
++
++static int pic16f1_verify(struct flash_bank *bank, const uint8_t *buffer,
++		uint32_t offset, uint32_t count)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	uint8_t *back = malloc(count ? count : 1);
++	unsigned int diffs = 0;
++
++	if (!back)
++		return ERROR_FAIL;
++	int retval = pic16f1_read(bank, back, offset, count);
++	if (retval == ERROR_OK) {
++		for (uint32_t i = 0; i < count; i++) {
++			uint32_t a = offset + i;
++			uint8_t want = buffer[i], got = back[i];
++
++			if (b->role == ROLE_FLASH && (a & 1))
++				want &= 0x3F, got &= 0x3F;
++			/* the EEPROM keeps one byte per word, in the low byte */
++			if (b->role == ROLE_EEPROM && (a & 1))
++				continue;
++			if (b->role == ROLE_CONFIG) {
++				uint32_t w = a / 2;
++				bool wanted = w < 4 || (w >= 7 && probed_device &&
++					w < 7U + probed_device->config_words);
++				if (!wanted)
++					continue;
++				if (a & 1)
++					want &= 0x3F, got &= 0x3F;
++			}
++			if (want != got) {
++				if (diffs++ < 5)
++					LOG_ERROR("pic16f1: verify mismatch at byte 0x%05" PRIx32 ": expected 0x%02x, read 0x%02x",
++						(uint32_t)bank->base + a, want, got);
++			}
++		}
++		if (diffs) {
++			LOG_ERROR("pic16f1: %u byte(s) differ", diffs);
++			retval = ERROR_FAIL;
++		}
++	}
++	free(back);
++	return retval;
++}
++
++static int pic16f1_erase_check(struct flash_bank *bank)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	const struct pic16f1_device *dev;
++
++	int retval = pic16f1_auto_probe(bank);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!bank->num_sectors)
++		return ERROR_OK;
++
++	uint8_t *buf = malloc(bank->size);
++	if (!buf)
++		return ERROR_FAIL;
++	retval = session_begin(bank, &dev);
++	if (retval == ERROR_OK) {
++		retval = read_range(bank, dev, buf, 0, bank->size);
++		session_end(bank);
++	}
++	if (retval == ERROR_OK) {
++		bool blank = true;
++		for (uint32_t i = 0; i < bank->size; i++) {
++			uint32_t w = i / 2;
++			uint8_t v = buf[i];
++
++			if (b->role == ROLE_CONFIG && !(w < 4 || (w >= 7 && w < 7U + dev->config_words)))
++				continue;
++			if (b->role == ROLE_EEPROM && (i & 1))
++				continue;
++			if (b->role != ROLE_EEPROM && (i & 1))
++				v |= 0xC0;
++			if (v != 0xFF)
++				blank = false;
++		}
++		bank->sectors[0].is_erased = blank ? 1 : 0;
++	}
++	free(buf);
++	return retval;
++}
++
++/* ---- Erasing ----------------------------------------------------------------------- */
++
++static int pic16f1_erase(struct flash_bank *bank, unsigned int first, unsigned int last)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	const struct pic16f1_device *dev;
++
++	int retval = pic16f1_auto_probe(bank);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!bank->num_sectors || first != 0 || last != 0)
++		return ERROR_FLASH_SECTOR_INVALID;
++
++	switch (b->role) {
++	case ROLE_CONFIG:
++		LOG_INFO("pic16f1: user IDs and configuration words are erased by erasing the "
++			"program flash bank (bulk erase); nothing done for this bank");
++		return ERROR_OK;
++	case ROLE_FLASH:
++		LOG_INFO("pic16f1: bulk erase: program memory, user IDs, configuration words and EEPROM");
++		break;
++	case ROLE_EEPROM:
++		break;
++	}
++
++	retval = session_begin(bank, &dev);
++	if (retval != ERROR_OK)
++		return retval;
++	if (b->role == ROLE_FLASH) {
++		retval = pic16f1_bulk_erase(dev);
++	} else {
++		retval = pic16f1_erase_eeprom();
++	}
++	int r2 = session_end(bank);
++	if (retval == ERROR_OK)
++		retval = r2;
++	if (retval == ERROR_OK)
++		bank->sectors[0].is_erased = 1;
++	return retval;
++}
++
++/* ---- Writing ----------------------------------------------------------------------- */
++
++static int write_flash(struct flash_bank *bank, const struct pic16f1_device *dev,
++		const uint8_t *buffer, uint32_t offset, uint32_t count)
++{
++	uint32_t row = dev->latches * 2;
++	uint32_t nwords = count / 2;
++	uint16_t *words;
++
++	if (offset % row || count % row) {
++		LOG_ERROR("pic16f1: flash writes must be aligned to %u bytes", (unsigned int)row);
++		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
++	}
++	words = malloc(nwords * sizeof(uint16_t));
++	if (!words)
++		return ERROR_FAIL;
++	pic16f1_bytes_to_words(buffer, nwords, words);
++	int retval = pic16f1_write_flash(dev, offset / 2, words, nwords);
++	if (retval == ERROR_OK) {
++		uint16_t *back = malloc(nwords * sizeof(uint16_t));
++		unsigned int errors = 0;
++
++		if (!back) {
++			free(words);
++			return ERROR_FAIL;
++		}
++		retval = pic16f1_read_words(offset / 2, nwords, back);
++		for (uint32_t i = 0; retval == ERROR_OK && i < nwords; i++) {
++			if (back[i] != words[i]) {
++				if (errors++ < 5)
++					LOG_ERROR("pic16f1: flash word 0x%04" PRIx32 ": wrote 0x%04x, read 0x%04x",
++						offset / 2 + i, words[i], back[i]);
++			}
++		}
++		if (errors) {
++			LOG_ERROR("pic16f1: verify failed, %u word(s) differ; was the flash erased?", errors);
++			retval = ERROR_FAIL;
++		}
++		free(back);
++	}
++	free(words);
++	return retval;
++}
++
++static int write_config(struct flash_bank *bank, const struct pic16f1_device *dev,
++		const uint8_t *buffer, uint32_t offset, uint32_t count)
++{
++	uint32_t first = offset / 2;
++	uint32_t nwords = count / 2;
++	uint16_t *words = malloc(nwords * sizeof(uint16_t));
++	int retval = ERROR_OK;
++
++	if (!words)
++		return ERROR_FAIL;
++	if ((offset | count) & 1) {
++		LOG_ERROR("pic16f1: configuration writes must be whole words");
++		free(words);
++		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
++	}
++	pic16f1_bytes_to_words(buffer, nwords, words);
++
++	for (uint32_t i = 0; i < nwords; i++) {
++		uint32_t w = first + i;
++		if (w == PIC16F1_CONFIG2_ADDR - 0x8000 && dev->debug &&
++				!(words[i] & PIC16F1_CONFIG2_DEBUG) && words[i] != PIC16F1_BLANK) {
++			LOG_ERROR("pic16f1: configuration word 2 enables DEBUG; a part with DEBUG "
++				"enabled needs the debug executive, use 'pic16f1 load_debug' instead");
++			free(words);
++			return ERROR_FAIL;
++		}
++	}
++	for (uint32_t i = 0; i < nwords && retval == ERROR_OK; i++) {
++		uint32_t w = first + i;
++		bool writable = w < PIC16F1_USERID_WORDS ||
++			(w >= PIC16F1_CONFIG_ADDR - 0x8000 &&
++			 w < PIC16F1_CONFIG_ADDR - 0x8000 + dev->config_words);
++
++		if (words[i] == PIC16F1_BLANK)
++			continue;
++		if (!writable) {
++			LOG_WARNING("pic16f1: not writing word 0x%04x (not a user ID or configuration word)",
++				0x8000 + w);
++			continue;
++		}
++		retval = pic16f1_write_config_words(0x8000 + w, &words[i], 1);
++		if (retval == ERROR_OK) {
++			uint16_t back;
++			retval = pic16f1_read_words(0x8000 + w, 1, &back);
++			if (retval == ERROR_OK && back != words[i]) {
++				LOG_ERROR("pic16f1: word 0x%04x: wrote 0x%04x, read 0x%04x",
++					0x8000 + w, words[i], back);
++				retval = ERROR_FAIL;
++			}
++		}
++	}
++	free(words);
++	return retval;
++}
++
++static int write_eeprom(struct flash_bank *bank, const struct pic16f1_device *dev,
++		const uint8_t *buffer, uint32_t offset, uint32_t count)
++{
++	uint32_t first = offset / 2;
++	uint32_t n = count / 2;
++	uint8_t *bytes = malloc(n ? n : 1);
++	uint8_t *back = malloc(PIC16F1_MAX_EEPROM);
++	int retval = ERROR_OK;
++
++	if (!bytes || !back) {
++		free(bytes);
++		free(back);
++		return ERROR_FAIL;
++	}
++	for (uint32_t i = 0; i < n; i++)
++		bytes[i] = buffer[2 * i];
++	retval = pic16f1_write_eeprom(first, bytes, n);
++	if (retval == ERROR_OK)
++		retval = pic16f1_read_eeprom(dev->eeprom, back);
++	for (uint32_t i = 0; retval == ERROR_OK && i < n; i++) {
++		if (bytes[i] != 0xFF && back[first + i] != bytes[i]) {
++			LOG_ERROR("pic16f1: EEPROM 0x%02" PRIx32 ": wrote 0x%02x, read 0x%02x",
++				first + i, bytes[i], back[first + i]);
++			retval = ERROR_FAIL;
++		}
++	}
++	free(bytes);
++	free(back);
++	return retval;
++}
++
++static int pic16f1_write(struct flash_bank *bank, const uint8_t *buffer,
++		uint32_t offset, uint32_t count)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	const struct pic16f1_device *dev;
++
++	int retval = pic16f1_auto_probe(bank);
++	if (retval != ERROR_OK)
++		return retval;
++	if (offset + count > bank->size) {
++		LOG_ERROR("pic16f1: write beyond the end of the bank");
++		return ERROR_FAIL;
++	}
++	retval = session_begin(bank, &dev);
++	if (retval != ERROR_OK)
++		return retval;
++	switch (b->role) {
++	case ROLE_FLASH:
++		retval = write_flash(bank, dev, buffer, offset, count);
++		break;
++	case ROLE_CONFIG:
++		retval = write_config(bank, dev, buffer, offset, count);
++		break;
++	case ROLE_EEPROM:
++		retval = write_eeprom(bank, dev, buffer, offset, count);
++		break;
++	}
++	int r2 = session_end(bank);
++	if (retval == ERROR_OK)
++		retval = r2;
++	if (retval == ERROR_OK && bank->num_sectors)
++		bank->sectors[0].is_erased = 0;
++	return retval;
++}
++
++static int pic16f1_info(struct flash_bank *bank, struct command_invocation *cmd)
++{
++	struct pic16f1_bank *b = bank->driver_priv;
++	const char *role[] = { "program flash", "user IDs and configuration words", "data EEPROM" };
++
++	if (!probed_device) {
++		command_print_sameline(cmd, "%s (not probed)", role[b->role]);
++		return ERROR_OK;
++	}
++	command_print_sameline(cmd, "%s, %s revision %u, %s",
++		role[b->role], probed_device->name,
++		(unsigned int)probed_rev, "erase = bulk erase of the device (see flash driver notes)");
++	return ERROR_OK;
++}
++
++static void pic16f1_free_driver_priv(struct flash_bank *bank)
++{
++	free(bank->driver_priv);
++	bank->driver_priv = NULL;
++}
++
++const struct flash_driver pic16f1_flash = {
++	.name = "pic16f1",
++	.usage = "flash bank <name> pic16f1 <base: 0x0 | 0x10000 | 0x1E000> 0 0 0 <target>",
++	.flash_bank_command = pic16f1_flash_bank_command,
++	.erase = pic16f1_erase,
++	.write = pic16f1_write,
++	.read = pic16f1_read,
++	.verify = pic16f1_verify,
++	.probe = pic16f1_probe,
++	.auto_probe = pic16f1_auto_probe,
++	.erase_check = pic16f1_erase_check,
++	.info = pic16f1_info,
++	.free_driver_priv = pic16f1_free_driver_priv,
++};
+diff --git a/src/jtag/Makefile.am b/src/jtag/Makefile.am
+index 43c6f8b..cd801b9 100644
+--- a/src/jtag/Makefile.am
++++ b/src/jtag/Makefile.am
+@@ -26,6 +26,7 @@ include %D%/drivers/Makefile.am
+ 	%D%/interfaces.c \
+ 	%D%/tcl.c \
+ 	%D%/swim.c \
++	%D%/icsp.c \
+ 	%D%/commands.h \
+ 	%D%/interface.h \
+ 	%D%/interfaces.h \
+@@ -33,6 +34,7 @@ include %D%/drivers/Makefile.am
+ 	%D%/jtag.h \
+ 	%D%/swd.h \
+ 	%D%/swim.h \
++	%D%/icsp.h \
+ 	%D%/tcl.h
+ 
+ STARTUP_TCL_SRCS += %D%/startup.tcl
+diff --git a/src/jtag/drivers/Makefile.am b/src/jtag/drivers/Makefile.am
+index 6410f37..b92116b 100644
+--- a/src/jtag/drivers/Makefile.am
++++ b/src/jtag/drivers/Makefile.am
+@@ -111,6 +111,9 @@ endif
+ if ESP_USB_JTAG
+ DRIVERFILES += %D%/esp_usb_jtag.c
+ endif
++if PK2ICSP
++DRIVERFILES += %D%/pk2icsp.c
++endif
+ if USBPROG
+ DRIVERFILES += %D%/usbprog.c
+ endif
+diff --git a/src/jtag/drivers/pk2icsp.c b/src/jtag/drivers/pk2icsp.c
+new file mode 100644
+index 0000000..75341cc
+--- /dev/null
++++ b/src/jtag/drivers/pk2icsp.c
+@@ -0,0 +1,321 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++/*
++ * Adapter driver for the PICkit 2 ICSP probe firmware (USB 04D8:0033,
++ * vendor specific interface, bulk endpoints 0x01 and 0x81).
++ *
++ * The probe executes batches of operations carried in one 64 byte packet
++ * and answers each packet with exactly one packet; the protocol is
++ * documented in docs/protocol.md of the probe project.  This driver only
++ * moves packets; the operation queue and the higher level functions are in
++ * jtag/icsp.c.
++ *
++ * The probe firmware has the same VID:PID as the stock PICkit 2 (HID), so
++ * the interface class is checked.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <jtag/interface.h>
++#include <jtag/icsp.h>
++#include <helper/command.h>
++#include <helper/log.h>
++#include "libusb_helper.h"
++
++#define PK2_VID  0x04D8
++#define PK2_PID  0x0033
++#define PK2_PKT  64
++
++#define PK2_CAP_GEN6 0x04
++#define PK2_CAP_ICD  0x10
++
++static struct icsp_config pk2_config = {
++	.vdd_mv = 3000,
++	.vpp_mv = 8500,
++	.power = true,
++	.hvp = false,
++	.power_off_on_quit = false,
++};
++
++static struct libusb_device_handle *pk2_dev;
++static unsigned int pk2_ep_in, pk2_ep_out;
++
++static const char *pk2_error_name(uint8_t code)
++{
++	switch (code) {
++	case 1: return "unknown operation";
++	case 2: return "operation runs past the end of the packet";
++	case 3: return "reply does not fit in one packet";
++	case 4: return "argument out of range";
++	case 5: return "debug executive did not respond";
++	case 6: return "VDD or VPP fault, target power was switched off";
++	default: return "unknown error";
++	}
++}
++
++static int pk2_transact(const uint8_t *req, size_t req_len,
++		uint8_t *reply, size_t *reply_len, uint8_t *status)
++{
++	uint8_t buf[PK2_PKT];
++	int transferred = 0;
++
++	*status = 0;
++	*reply_len = 0;
++	if (!pk2_dev || req_len == 0 || req_len > PK2_PKT)
++		return ERROR_FAIL;
++
++	memcpy(buf, req, req_len);
++	int r = jtag_libusb_bulk_write(pk2_dev, pk2_ep_out, (char *)buf, req_len, 2000, &transferred);
++	if (r != 0 || (size_t)transferred != req_len) {
++		LOG_ERROR("pk2icsp: USB write failed (%d)", r);
++		return ERROR_FAIL;
++	}
++	r = jtag_libusb_bulk_read(pk2_dev, pk2_ep_in, (char *)buf, PK2_PKT, 10000, &transferred);
++	if (r != 0 || transferred < 2) {
++		LOG_ERROR("pk2icsp: USB read failed (%d, %d bytes)", r, transferred);
++		return ERROR_FAIL;
++	}
++	if (buf[0]) {
++		*status = buf[0];
++		/* A debug executive timeout is an expected outcome while probing */
++		if (buf[0] == ICSP_ERR_TIMEOUT)
++			LOG_DEBUG("pk2icsp: %s (operation at offset %u)", pk2_error_name(buf[0]), buf[1]);
++		else
++			LOG_ERROR("pk2icsp: %s (operation at offset %u)", pk2_error_name(buf[0]), buf[1]);
++		return ERROR_FAIL;
++	}
++	memcpy(reply, buf + 2, transferred - 2);
++	*reply_len = transferred - 2;
++	return ERROR_OK;
++}
++
++static const struct icsp_driver pk2_icsp_ops = {
++	.transact = pk2_transact,
++	.config = &pk2_config,
++};
++
++static int pk2_init(void)
++{
++	const uint16_t vids[] = { PK2_VID, 0 };
++	const uint16_t pids[] = { PK2_PID, 0 };
++
++	if (jtag_libusb_open(vids, pids, &pk2_dev, NULL) != ERROR_OK) {
++		LOG_ERROR("pk2icsp: cannot open USB device %04x:%04x", PK2_VID, PK2_PID);
++		return ERROR_JTAG_INIT_FAILED;
++	}
++	if (jtag_libusb_choose_interface(pk2_dev, &pk2_ep_in, &pk2_ep_out, 0xFF, -1, -1,
++			LIBUSB_TRANSFER_TYPE_BULK) != ERROR_OK) {
++		LOG_ERROR("pk2icsp: no vendor specific bulk interface; is the probe firmware loaded "
++			"(not the stock PICkit 2 firmware or its bootloader)?");
++		jtag_libusb_close(pk2_dev);
++		pk2_dev = NULL;
++		return ERROR_JTAG_INIT_FAILED;
++	}
++
++	uint8_t info[8];
++	const uint8_t op_info[] = { ICSP_OP_INFO };
++	if (icsp_run(op_info, sizeof(op_info), info, sizeof(info)) != ERROR_OK ||
++			memcmp(info, "PK2P", 4) != 0) {
++		LOG_ERROR("pk2icsp: the device does not answer like the probe firmware");
++		jtag_libusb_close(pk2_dev);
++		pk2_dev = NULL;
++		return ERROR_JTAG_INIT_FAILED;
++	}
++	LOG_INFO("pk2icsp: probe firmware %u.%u, protocol %u, capabilities 0x%02x",
++		info[4], info[5], info[6], info[7]);
++	if (!(info[7] & PK2_CAP_GEN6) || !(info[7] & PK2_CAP_ICD))
++		LOG_WARNING("pk2icsp: probe lacks 6 bit command or debug link support");
++
++	if (pk2_config.power) {
++		if (icsp_power_on() != ERROR_OK) {
++			jtag_libusb_close(pk2_dev);
++			pk2_dev = NULL;
++			return ERROR_JTAG_INIT_FAILED;
++		}
++	} else {
++		LOG_INFO("pk2icsp: target is self-powered, the probe does not supply VDD");
++	}
++	return ERROR_OK;
++}
++
++static int pk2_quit(void)
++{
++	if (!pk2_dev)
++		return ERROR_OK;
++
++	/* Leave the pins released. Target power stays on, so that a debug
++	 * session survives and can be re-attached, unless configured. */
++	icsp_release();
++	if (pk2_config.power && pk2_config.power_off_on_quit)
++		icsp_power_off();
++
++	jtag_libusb_close(pk2_dev);
++	pk2_dev = NULL;
++	return ERROR_OK;
++}
++
++COMMAND_HANDLER(pk2_handle_vdd_command)
++{
++	if (CMD_ARGC == 0) {
++		command_print(CMD, "%u", pk2_config.vdd_mv);
++		return ERROR_OK;
++	}
++	if (CMD_ARGC != 1)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	unsigned int mv;
++	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[0], mv);
++	if (mv > ICSP_VDD_MAX_MV || mv < 1800) {
++		command_print(CMD, "pk2icsp: VDD must be 1800 to %u mV", ICSP_VDD_MAX_MV);
++		return ERROR_COMMAND_ARGUMENT_INVALID;
++	}
++	pk2_config.vdd_mv = mv;
++	if (pk2_dev && pk2_config.power) {
++		LOG_INFO("pk2icsp: new VDD applies the next time the target is powered");
++	}
++	return ERROR_OK;
++}
++
++COMMAND_HANDLER(pk2_handle_vpp_command)
++{
++	if (CMD_ARGC == 0) {
++		command_print(CMD, "%u", pk2_config.vpp_mv);
++		return ERROR_OK;
++	}
++	if (CMD_ARGC != 1)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	unsigned int mv;
++	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[0], mv);
++	if (mv < 5000 || mv > 13000) {
++		command_print(CMD, "pk2icsp: VPP must be 5000 to 13000 mV");
++		return ERROR_COMMAND_ARGUMENT_INVALID;
++	}
++	pk2_config.vpp_mv = mv;
++	return ERROR_OK;
++}
++
++static int pk2_bool_command(struct command_invocation *cmd, bool *flag)
++{
++	if (CMD_ARGC == 0) {
++		command_print(cmd, "%s", *flag ? "on" : "off");
++		return ERROR_OK;
++	}
++	if (CMD_ARGC != 1)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++	if (!strcmp(CMD_ARGV[0], "on") || !strcmp(CMD_ARGV[0], "1"))
++		*flag = true;
++	else if (!strcmp(CMD_ARGV[0], "off") || !strcmp(CMD_ARGV[0], "0"))
++		*flag = false;
++	else
++		return ERROR_COMMAND_SYNTAX_ERROR;
++	return ERROR_OK;
++}
++
++COMMAND_HANDLER(pk2_handle_power_command)
++{
++	return pk2_bool_command(CMD, &pk2_config.power);
++}
++
++COMMAND_HANDLER(pk2_handle_hvp_command)
++{
++	return pk2_bool_command(CMD, &pk2_config.hvp);
++}
++
++COMMAND_HANDLER(pk2_handle_power_off_on_quit_command)
++{
++	return pk2_bool_command(CMD, &pk2_config.power_off_on_quit);
++}
++
++COMMAND_HANDLER(pk2_handle_status_command)
++{
++	struct icsp_status st;
++
++	if (!pk2_dev) {
++		command_print(CMD, "pk2icsp: not initialised");
++		return ERROR_FAIL;
++	}
++	int retval = icsp_get_status(&st);
++	if (retval != ERROR_OK)
++		return retval;
++	command_print(CMD, "VDD %u mV, VPP rail %u mV, flags 0x%02x%s%s%s%s%s",
++		st.vdd_mv, st.vpp_mv, st.flags,
++		(st.flags & ICSP_ST_VDD_ON) ? " vdd-on" : "",
++		(st.flags & ICSP_ST_VPP_SWITCH) ? " vpp-on-mclr" : "",
++		(st.flags & ICSP_ST_MCLR_GND) ? " mclr-grounded" : "",
++		(st.flags & ICSP_ST_VDD_FAULT) ? " VDD-FAULT" : "",
++		(st.flags & ICSP_ST_VPP_FAULT) ? " VPP-FAULT" : "");
++	return ERROR_OK;
++}
++
++static const struct command_registration pk2_subcommand_handlers[] = {
++	{
++		.name = "vdd",
++		.handler = pk2_handle_vdd_command,
++		.mode = COMMAND_ANY,
++		.help = "set or show the target VDD setpoint in mV (1800-5000, default 3000)",
++		.usage = "[mV]",
++	},
++	{
++		.name = "vpp",
++		.handler = pk2_handle_vpp_command,
++		.mode = COMMAND_ANY,
++		.help = "set or show VPP in mV used for high voltage entry (default 8500)",
++		.usage = "[mV]",
++	},
++	{
++		.name = "power",
++		.handler = pk2_handle_power_command,
++		.mode = COMMAND_ANY,
++		.help = "whether the probe supplies the target (default on)",
++		.usage = "[on|off]",
++	},
++	{
++		.name = "hvp",
++		.handler = pk2_handle_hvp_command,
++		.mode = COMMAND_ANY,
++		.help = "enter programming mode with VPP on MCLR instead of the low voltage key (default off)",
++		.usage = "[on|off]",
++	},
++	{
++		.name = "power_off_on_quit",
++		.handler = pk2_handle_power_off_on_quit_command,
++		.mode = COMMAND_ANY,
++		.help = "switch target power off when OpenOCD exits (default off)",
++		.usage = "[on|off]",
++	},
++	{
++		.name = "status",
++		.handler = pk2_handle_status_command,
++		.mode = COMMAND_EXEC,
++		.help = "show the probe's power flags and voltages",
++		.usage = "",
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++static const struct command_registration pk2_command_handlers[] = {
++	{
++		.name = "pk2icsp",
++		.mode = COMMAND_ANY,
++		.help = "PICkit 2 ICSP probe commands",
++		.usage = "",
++		.chain = pk2_subcommand_handlers,
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++static const char * const pk2_transports[] = { "icsp", NULL };
++
++struct adapter_driver pk2icsp_adapter_driver = {
++	.name = "pk2icsp",
++	.transports = pk2_transports,
++	.commands = pk2_command_handlers,
++
++	.init = pk2_init,
++	.quit = pk2_quit,
++
++	.icsp_ops = &pk2_icsp_ops,
++};
+diff --git a/src/jtag/icsp.c b/src/jtag/icsp.c
+new file mode 100644
+index 0000000..b8d7142
+--- /dev/null
++++ b/src/jtag/icsp.c
+@@ -0,0 +1,575 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++/*
++ * ICSP transport for Microchip PIC16F1 devices, see icsp.h.
++ *
++ * Besides registering the "icsp" transport this file turns the raw
++ * request/reply exchange the adapter driver provides into the operations
++ * the flash and target drivers need.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "interface.h"
++#include "icsp.h"
++#include <helper/command.h>
++#include <helper/log.h>
++#include <helper/time_support.h>
++#include <transport/transport.h>
++
++extern struct adapter_driver *adapter_driver;
++
++#define PKT_SIZE        64
++#define REPLY_DATA_MAX  (PKT_SIZE - 2)
++
++struct queued_op {
++	size_t offset;
++	size_t len;
++	size_t reply_len;
++};
++
++static uint8_t *q_data;
++static size_t q_data_len, q_data_cap;
++static struct queued_op *q_ops;
++static size_t q_num_ops, q_ops_cap;
++static uint8_t last_status;
++
++static const struct icsp_driver *drv(void)
++{
++	return adapter_driver ? adapter_driver->icsp_ops : NULL;
++}
++
++const struct icsp_config *icsp_get_config(void)
++{
++	return drv() ? drv()->config : NULL;
++}
++
++uint8_t icsp_last_status(void)
++{
++	return last_status;
++}
++
++void icsp_queue_clear(void)
++{
++	q_data_len = 0;
++	q_num_ops = 0;
++}
++
++int icsp_queue(const uint8_t *op, size_t len, size_t reply_len)
++{
++	if (len == 0 || len > PKT_SIZE || reply_len > REPLY_DATA_MAX) {
++		LOG_ERROR("icsp: bad operation size");
++		return ERROR_FAIL;
++	}
++
++	if (q_data_len + len > q_data_cap) {
++		size_t cap = q_data_cap ? q_data_cap * 2 : 4096;
++		while (cap < q_data_len + len)
++			cap *= 2;
++		uint8_t *n = realloc(q_data, cap);
++		if (!n)
++			return ERROR_FAIL;
++		q_data = n;
++		q_data_cap = cap;
++	}
++	if (q_num_ops + 1 > q_ops_cap) {
++		size_t cap = q_ops_cap ? q_ops_cap * 2 : 512;
++		struct queued_op *n = realloc(q_ops, cap * sizeof(*n));
++		if (!n)
++			return ERROR_FAIL;
++		q_ops = n;
++		q_ops_cap = cap;
++	}
++
++	memcpy(q_data + q_data_len, op, len);
++	q_ops[q_num_ops].offset = q_data_len;
++	q_ops[q_num_ops].len = len;
++	q_ops[q_num_ops].reply_len = reply_len;
++	q_num_ops++;
++	q_data_len += len;
++	return ERROR_OK;
++}
++
++static int transact(const uint8_t *req, size_t req_len, uint8_t *out, size_t *out_len)
++{
++	const struct icsp_driver *d = drv();
++	uint8_t reply[PKT_SIZE];
++	size_t rlen = 0;
++	uint8_t status = 0;
++
++	if (!d) {
++		LOG_ERROR("icsp: no adapter");
++		return ERROR_FAIL;
++	}
++	int retval = d->transact(req, req_len, reply, &rlen, &status);
++	last_status = status;
++	if (retval != ERROR_OK)
++		return retval;
++	memcpy(out, reply, rlen);
++	*out_len = rlen;
++	return ERROR_OK;
++}
++
++int icsp_flush(uint8_t *out, size_t out_size)
++{
++	uint8_t req[PKT_SIZE];
++	uint8_t reply[PKT_SIZE];
++	size_t req_len = 0, rlen_expected = 0, total = 0;
++	int retval = ERROR_OK;
++
++	last_status = 0;
++
++	for (size_t i = 0; i <= q_num_ops && retval == ERROR_OK; i++) {
++		bool last = (i == q_num_ops);
++		if (!last) {
++			struct queued_op *o = &q_ops[i];
++			if (req_len + o->len <= PKT_SIZE &&
++					rlen_expected + o->reply_len <= REPLY_DATA_MAX) {
++				memcpy(req + req_len, q_data + o->offset, o->len);
++				req_len += o->len;
++				rlen_expected += o->reply_len;
++				continue;
++			}
++		}
++		if (req_len) {
++			size_t got = 0;
++			retval = transact(req, req_len, reply, &got);
++			if (retval == ERROR_OK) {
++				if (got != rlen_expected) {
++					LOG_ERROR("icsp: probe returned %zu data bytes, expected %zu",
++						got, rlen_expected);
++					retval = ERROR_FAIL;
++				} else if (out) {
++					if (total + got > out_size) {
++						LOG_ERROR("icsp: reply buffer too small");
++						retval = ERROR_FAIL;
++					} else {
++						memcpy(out + total, reply, got);
++					}
++				}
++				total += got;
++			}
++		}
++		req_len = 0;
++		rlen_expected = 0;
++		if (!last && retval == ERROR_OK) {
++			struct queued_op *o = &q_ops[i];
++			memcpy(req, q_data + o->offset, o->len);
++			req_len = o->len;
++			rlen_expected = o->reply_len;
++		}
++	}
++
++	icsp_queue_clear();
++	return retval;
++}
++
++int icsp_run(const uint8_t *op, size_t len, uint8_t *reply, size_t reply_len)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = icsp_queue(op, len, reply_len);
++	if (retval != ERROR_OK)
++		return retval;
++	return icsp_flush(reply, reply_len);
++}
++
++/* ---- Queued helpers ----------------------------------------------------- */
++
++#define QUEUE(...) \
++	do { \
++		const uint8_t op_[] = { __VA_ARGS__ }; \
++		return icsp_queue(op_, sizeof(op_), 0); \
++	} while (0)
++
++int icsp_set_vdd(unsigned int mv)
++{
++	const struct icsp_config *c = icsp_get_config();
++	unsigned int max = c ? ICSP_VDD_MAX_MV : 0;
++
++	if (mv > max) {
++		LOG_ERROR("icsp: refusing VDD of %u mV (limit %u mV)", mv, max);
++		return ERROR_FAIL;
++	}
++	QUEUE(ICSP_OP_SET_VDD, mv & 0xFF, mv >> 8);
++}
++
++int icsp_vdd_mode(unsigned int mode)
++{
++	QUEUE(ICSP_OP_VDD_MODE, mode);
++}
++
++int icsp_set_vpp(unsigned int mv)
++{
++	if (mv > 13000) {
++		LOG_ERROR("icsp: refusing VPP of %u mV", mv);
++		return ERROR_FAIL;
++	}
++	QUEUE(ICSP_OP_SET_VPP, mv & 0xFF, mv >> 8);
++}
++
++int icsp_mclr(unsigned int mode)
++{
++	QUEUE(ICSP_OP_MCLR, mode);
++}
++
++int icsp_pins(uint8_t pins)
++{
++	const uint8_t op[] = { ICSP_OP_PINS, pins };
++	return icsp_queue(op, sizeof(op), 1);
++}
++
++int icsp_delay_us(unsigned int us)
++{
++	while (us) {
++		unsigned int n = us > 0xFFFF ? 0xFFFF : us;
++		const uint8_t op[] = { ICSP_OP_DELAY_US, n & 0xFF, n >> 8 };
++		int retval = icsp_queue(op, sizeof(op), 0);
++		if (retval != ERROR_OK)
++			return retval;
++		us -= n;
++	}
++	return ERROR_OK;
++}
++
++int icsp_delay_ms(unsigned int ms)
++{
++	while (ms) {
++		unsigned int n = ms > 100 ? 100 : ms;
++		const uint8_t op[] = { ICSP_OP_DELAY_MS, n };
++		int retval = icsp_queue(op, sizeof(op), 0);
++		if (retval != ERROR_OK)
++			return retval;
++		ms -= n;
++	}
++	return ERROR_OK;
++}
++
++int icsp_led(bool on)
++{
++	QUEUE(ICSP_OP_LED, on ? 1 : 0);
++}
++
++int icsp_clear_faults(void)
++{
++	QUEUE(ICSP_OP_CLEAR_FAULTS);
++}
++
++/* ---- Immediate helpers --------------------------------------------------- */
++
++int icsp_get_status(struct icsp_status *st)
++{
++	uint8_t r[2];
++	uint8_t v[8];
++	const uint8_t op_status[] = { ICSP_OP_STATUS };
++	const uint8_t op_volt[] = { ICSP_OP_READ_VOLT };
++
++	int retval = icsp_run(op_status, sizeof(op_status), r, sizeof(r));
++	if (retval != ERROR_OK)
++		return retval;
++	retval = icsp_run(op_volt, sizeof(op_volt), v, sizeof(v));
++	if (retval != ERROR_OK)
++		return retval;
++	st->flags = r[0];
++	st->pins = r[1];
++	st->vdd_mv = v[0] | (v[1] << 8);
++	st->vpp_mv = v[2] | (v[3] << 8);
++	return ERROR_OK;
++}
++
++int icsp_wait_vpp(unsigned int mv, unsigned int timeout_ms)
++{
++	int64_t end = timeval_ms() + timeout_ms;
++	struct icsp_status st;
++
++	for (;;) {
++		int retval = icsp_get_status(&st);
++		if (retval != ERROR_OK)
++			return retval;
++		if (st.vpp_mv + 400 >= mv)
++			return ERROR_OK;
++		if (timeval_ms() > end) {
++			LOG_ERROR("icsp: VPP only reached %u mV, wanted %u mV", st.vpp_mv, mv);
++			return ERROR_FAIL;
++		}
++		alive_sleep(10);
++	}
++}
++
++int icsp_release(void)
++{
++	int retval = icsp_pins(ICSP_PINS_IDLE);
++	if (retval == ERROR_OK)
++		retval = icsp_mclr(ICSP_MCLR_RELEASE);
++	if (retval == ERROR_OK)
++		retval = icsp_set_vpp(0);
++	if (retval == ERROR_OK)
++		retval = icsp_led(false);
++	if (retval != ERROR_OK) {
++		icsp_queue_clear();
++		return retval;
++	}
++	return icsp_flush(NULL, 0);
++}
++
++int icsp_power_on(void)
++{
++	const struct icsp_config *c = icsp_get_config();
++	struct icsp_status st;
++
++	if (!c || !c->power)
++		return ERROR_OK;
++	int retval = icsp_get_status(&st);
++	if (retval != ERROR_OK)
++		return retval;
++	if (st.flags & ICSP_ST_VDD_ON) {
++		LOG_INFO("icsp: target power is already on (VDD %u mV)", st.vdd_mv);
++		return ERROR_OK;
++	}
++	if (icsp_clear_faults() != ERROR_OK || icsp_set_vdd(c->vdd_mv) != ERROR_OK) {
++		icsp_queue_clear();
++		return ERROR_FAIL;
++	}
++	icsp_pins(ICSP_PINS_IDLE);
++	icsp_mclr(ICSP_MCLR_RELEASE);
++	icsp_vdd_mode(ICSP_VDD_ON);
++	icsp_delay_ms(100);
++	retval = icsp_flush(NULL, 0);
++	if (retval == ERROR_OK && icsp_get_status(&st) == ERROR_OK)
++		LOG_INFO("icsp: target VDD %u mV", st.vdd_mv);
++	return retval;
++}
++
++int icsp_power_off(void)
++{
++	icsp_pins(ICSP_PINS_IDLE);
++	icsp_mclr(ICSP_MCLR_RELEASE);
++	icsp_set_vpp(0);
++	icsp_vdd_mode(ICSP_VDD_DISCHARGE);
++	icsp_delay_ms(50);
++	icsp_vdd_mode(ICSP_VDD_OFF);
++	return icsp_flush(NULL, 0);
++}
++
++int icsp_enter_programming(void)
++{
++	const struct icsp_config *c = icsp_get_config();
++	const uint8_t key[] = { ICSP_OP_KEY, 0 /* LSB first */, 'P', 'H', 'C', 'M', 1 };
++	int retval;
++
++	if (!c)
++		return ERROR_FAIL;
++
++	icsp_clear_faults();
++	icsp_led(true);
++	icsp_pins(ICSP_PINS_LOW);
++	icsp_mclr(ICSP_MCLR_GROUND);
++	if (c->power)
++		icsp_set_vdd(c->vdd_mv);
++	retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++
++	if (c->hvp) {
++		icsp_set_vpp(c->vpp_mv);
++		retval = icsp_flush(NULL, 0);
++		if (retval == ERROR_OK)
++			retval = icsp_wait_vpp(c->vpp_mv, 1000);
++		if (retval != ERROR_OK)
++			goto fail;
++		if (c->power) {
++			/* VPP first, so entry works whatever the configuration
++			 * words say about MCLR and the oscillator. */
++			icsp_vdd_mode(ICSP_VDD_DISCHARGE);
++			icsp_delay_ms(50);
++			icsp_vdd_mode(ICSP_VDD_OFF);
++			icsp_mclr(ICSP_MCLR_VPP);
++			icsp_delay_us(200);
++			icsp_vdd_mode(ICSP_VDD_ON);
++			icsp_delay_ms(10);
++		} else {
++			icsp_delay_ms(5);
++			icsp_mclr(ICSP_MCLR_VPP);
++			icsp_delay_ms(5);
++		}
++	} else {
++		if (c->power) {
++			icsp_vdd_mode(ICSP_VDD_ON);
++			icsp_delay_ms(20);
++		}
++		icsp_mclr(ICSP_MCLR_RELEASE);
++		icsp_delay_ms(2);
++		icsp_mclr(ICSP_MCLR_GROUND);
++		icsp_delay_ms(2);
++		icsp_queue(key, sizeof(key), 0);
++		icsp_delay_ms(2);
++	}
++	retval = icsp_flush(NULL, 0);
++	if (retval == ERROR_OK)
++		return ERROR_OK;
++fail:
++	icsp_queue_clear();
++	icsp_exit_programming(false);
++	return retval;
++}
++
++int icsp_exit_programming(bool keep_power)
++{
++	const struct icsp_config *c = icsp_get_config();
++
++	icsp_mclr(ICSP_MCLR_GROUND);
++	icsp_delay_ms(2);
++	icsp_set_vpp(0);
++	icsp_pins(ICSP_PINS_IDLE);
++	if (c && c->power && !keep_power) {
++		icsp_vdd_mode(ICSP_VDD_DISCHARGE);
++		icsp_delay_ms(50);
++		icsp_vdd_mode(ICSP_VDD_OFF);
++	}
++	icsp_mclr(ICSP_MCLR_RELEASE);
++	icsp_led(false);
++	return icsp_flush(NULL, 0);
++}
++
++/* ---- Debug executive link ------------------------------------------------ */
++
++int icsp_icd_ready(bool *ready)
++{
++	uint8_t r;
++	const uint8_t op[] = { ICSP_OP_ICD_READY };
++	int retval = icsp_run(op, sizeof(op), &r, 1);
++
++	if (retval == ERROR_OK)
++		*ready = r != 0;
++	return retval;
++}
++
++int icsp_icd_queue(const uint8_t *tx, size_t tx_len, size_t rx_len)
++{
++	uint8_t op[PKT_SIZE];
++	int retval;
++
++	if (tx_len > 60)
++		return ERROR_FAIL;
++	if (tx_len) {
++		op[0] = ICSP_OP_ICD_TX;
++		op[1] = 50;                 /* 500 ms */
++		op[2] = tx_len;
++		memcpy(op + 3, tx, tx_len);
++		retval = icsp_queue(op, 3 + tx_len, 0);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	if (rx_len) {
++		const uint8_t rx[] = { ICSP_OP_ICD_RX, 50, rx_len };
++		return icsp_queue(rx, sizeof(rx), rx_len);
++	}
++	return ERROR_OK;
++}
++
++int icsp_icd_xfer(const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t rx_len)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = icsp_icd_queue(tx, tx_len, rx_len);
++	if (retval != ERROR_OK)
++		return retval;
++	return icsp_flush(rx, rx_len);
++}
++
++/* ---- Transport ------------------------------------------------------------ */
++
++COMMAND_HANDLER(handle_icsp_newtap_command)
++{
++	struct jtag_tap *tap;
++
++	/* A pseudo TAP, so that targets have a chain position to refer to,
++	 * as with the SWIM transport. */
++	if (CMD_ARGC < 2)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	tap = calloc(1, sizeof(*tap));
++	if (!tap) {
++		LOG_ERROR("Out of memory");
++		return ERROR_FAIL;
++	}
++
++	tap->chip = strdup(CMD_ARGV[0]);
++	tap->tapname = strdup(CMD_ARGV[1]);
++	tap->dotted_name = alloc_printf("%s.%s", CMD_ARGV[0], CMD_ARGV[1]);
++	if (!tap->chip || !tap->tapname || !tap->dotted_name) {
++		LOG_ERROR("Out of memory");
++		free(tap->dotted_name);
++		free(tap->tapname);
++		free(tap->chip);
++		free(tap);
++		return ERROR_FAIL;
++	}
++
++	LOG_DEBUG("Creating new ICSP \"tap\", Chip: %s, Tap: %s, Dotted: %s",
++		tap->chip, tap->tapname, tap->dotted_name);
++
++	tap->enabled = true;
++	jtag_tap_init(tap);
++	return ERROR_OK;
++}
++
++static const struct command_registration icsp_transport_subcommand_handlers[] = {
++	{
++		.name = "newtap",
++		.handler = handle_icsp_newtap_command,
++		.mode = COMMAND_CONFIG,
++		.help = "Create a new pseudo TAP instance named basename.tap_type, "
++			"to attach a target to.",
++		.usage = "basename tap_type",
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++static const struct command_registration icsp_transport_command_handlers[] = {
++	{
++		.name = "icsp",
++		.mode = COMMAND_ANY,
++		.help = "perform icsp adapter actions",
++		.usage = "",
++		.chain = icsp_transport_subcommand_handlers,
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++static int icsp_transport_select(struct command_context *cmd_ctx)
++{
++	LOG_DEBUG(__func__);
++	return register_commands(cmd_ctx, NULL, icsp_transport_command_handlers);
++}
++
++static int icsp_transport_init(struct command_context *cmd_ctx)
++{
++	LOG_DEBUG(__func__);
++	if (!drv()) {
++		LOG_ERROR("the adapter does not implement the icsp transport");
++		return ERROR_FAIL;
++	}
++	return ERROR_OK;
++}
++
++static struct transport icsp_transport = {
++	.name = "icsp",
++	.select = icsp_transport_select,
++	.init = icsp_transport_init,
++};
++
++static void icsp_constructor(void) __attribute__ ((constructor));
++static void icsp_constructor(void)
++{
++	transport_register(&icsp_transport);
++}
++
++bool transport_is_icsp(void)
++{
++	return get_current_transport() == &icsp_transport;
++}
+diff --git a/src/jtag/icsp.h b/src/jtag/icsp.h
+new file mode 100644
+index 0000000..96cf4bd
+--- /dev/null
++++ b/src/jtag/icsp.h
+@@ -0,0 +1,197 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++/*
++ * ICSP transport: in-circuit serial programming of Microchip PIC16F1
++ * devices through a probe that executes batches of ICSP operations.
++ *
++ * The adapter driver (see drivers/pk2icsp.c) only has to move one request
++ * packet to the probe and bring the reply back.  Everything else, the
++ * queueing of operations, power and pin control, programming mode entry and
++ * the debug-executive link, is implemented here on top of that, using the
++ * operation set of the PICkit 2 ICSP probe (docs/protocol.md of the probe
++ * project, firmware/proto.h).
++ */
++
++#ifndef OPENOCD_JTAG_ICSP_H
++#define OPENOCD_JTAG_ICSP_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++/* Probe operations (firmware/proto.h) */
++#define ICSP_OP_END           0x00
++#define ICSP_OP_INFO          0x01
++#define ICSP_OP_STATUS        0x02
++#define ICSP_OP_READ_VOLT     0x03
++#define ICSP_OP_SET_VDD       0x04
++#define ICSP_OP_VDD_MODE      0x05
++#define ICSP_OP_SET_VPP       0x06
++#define ICSP_OP_MCLR          0x07
++#define ICSP_OP_PINS          0x08
++#define ICSP_OP_DELAY_US      0x09
++#define ICSP_OP_DELAY_MS      0x0A
++#define ICSP_OP_SPEED         0x0B
++#define ICSP_OP_LED           0x0C
++#define ICSP_OP_CLEAR_FAULTS  0x0D
++#define ICSP_OP_WRITE_BITS    0x10
++#define ICSP_OP_READ_BITS     0x11
++#define ICSP_OP_KEY           0x12
++#define ICSP_OP_G6_CMD        0x20
++#define ICSP_OP_G6_LOAD       0x21
++#define ICSP_OP_G6_READ       0x22
++#define ICSP_OP_G6_READN      0x23
++#define ICSP_OP_G6_LOADN      0x24
++#define ICSP_OP_ICD_READY     0x40
++#define ICSP_OP_ICD_TX        0x41
++#define ICSP_OP_ICD_RX        0x42
++
++/* VDD_MODE arguments */
++#define ICSP_VDD_OFF          0
++#define ICSP_VDD_ON           1
++#define ICSP_VDD_DISCHARGE    2
++
++/* MCLR arguments */
++#define ICSP_MCLR_RELEASE     0
++#define ICSP_MCLR_GROUND      1
++#define ICSP_MCLR_VPP         2
++
++/* PINS byte */
++#define ICSP_PIN_DAT          0x01
++#define ICSP_PIN_DAT_IN       0x02
++#define ICSP_PIN_CLK          0x04
++#define ICSP_PIN_CLK_IN       0x08
++#define ICSP_PINS_IDLE        (ICSP_PIN_DAT_IN | ICSP_PIN_CLK_IN)
++#define ICSP_PINS_LOW         0x00
++
++/* STATUS power flags */
++#define ICSP_ST_VDD_ON        0x01
++#define ICSP_ST_VDD_GND       0x02
++#define ICSP_ST_VPP_PUMP      0x04
++#define ICSP_ST_VPP_SWITCH    0x08
++#define ICSP_ST_MCLR_GND      0x10
++#define ICSP_ST_VDD_FAULT     0x20
++#define ICSP_ST_VPP_FAULT     0x40
++#define ICSP_ST_BUTTON        0x80
++
++/* Probe status codes (first byte of a reply) */
++#define ICSP_ERR_TIMEOUT      5
++
++#define ICSP_VDD_MAX_MV       5000   /* the adapter refuses more */
++
++/** Settings the adapter driver keeps and the transport layer follows. */
++struct icsp_config {
++	unsigned int vdd_mv;       /**< target VDD setpoint */
++	unsigned int vpp_mv;       /**< VPP for high voltage entry */
++	bool power;                /**< the probe supplies the target */
++	bool hvp;                  /**< enter programming mode with VPP on MCLR */
++	bool power_off_on_quit;    /**< switch target power off when OpenOCD exits */
++};
++
++struct icsp_driver {
++	/**
++	 * Send one request packet (at most 64 bytes) and return the reply data.
++	 *
++	 * @param req request bytes
++	 * @param req_len number of request bytes
++	 * @param reply receives the reply data (everything after the two header
++	 *   bytes), at least 62 bytes
++	 * @param reply_len receives the number of data bytes
++	 * @param status receives the probe's status code (0 = ok)
++	 * @return ERROR_OK if the exchange worked and the status is 0
++	 */
++	int (*transact)(const uint8_t *req, size_t req_len,
++			uint8_t *reply, size_t *reply_len, uint8_t *status);
++
++	/** Settings, owned by the driver. */
++	struct icsp_config *config;
++};
++
++/* ---- Operation queue ---------------------------------------------------- */
++
++/**
++ * Queue one operation (opcode and arguments) that returns reply_len bytes.
++ * Nothing is sent before icsp_flush().
++ */
++int icsp_queue(const uint8_t *op, size_t len, size_t reply_len);
++
++/**
++ * Send everything queued, in as many packets as needed, and copy the
++ * returned data (all operations, in order) to out. out may be NULL if the
++ * caller does not care for the data; otherwise out_size must be big enough.
++ * The queue is emptied also on failure.
++ */
++int icsp_flush(uint8_t *out, size_t out_size);
++
++/** Discard the queue. */
++void icsp_queue_clear(void);
++
++/** Send one operation now. */
++int icsp_run(const uint8_t *op, size_t len, uint8_t *reply, size_t reply_len);
++
++/** Status code of the last failed exchange (0 if none). */
++uint8_t icsp_last_status(void);
++
++/* ---- Queued helpers (each only queues) ---------------------------------- */
++
++int icsp_set_vdd(unsigned int mv);
++int icsp_vdd_mode(unsigned int mode);
++int icsp_set_vpp(unsigned int mv);
++int icsp_mclr(unsigned int mode);
++int icsp_pins(uint8_t pins);
++int icsp_delay_us(unsigned int us);
++int icsp_delay_ms(unsigned int ms);
++int icsp_led(bool on);
++int icsp_clear_faults(void);
++
++/* ---- Immediate helpers --------------------------------------------------- */
++
++struct icsp_status {
++	uint8_t flags;      /**< ICSP_ST_* */
++	uint8_t pins;
++	unsigned int vdd_mv;
++	unsigned int vpp_mv;
++};
++
++int icsp_get_status(struct icsp_status *st);
++int icsp_wait_vpp(unsigned int mv, unsigned int timeout_ms);
++
++/** Release the pins and MCLR, VPP converter stopped. VDD untouched. */
++int icsp_release(void);
++
++/** Switch target power on at the configured setpoint (if not on yet). */
++int icsp_power_on(void);
++
++/** Discharge and switch target power off. */
++int icsp_power_off(void);
++
++/**
++ * Enter 6 bit command programming mode (PIC16F1xxx). Uses the high voltage
++ * method if configured, else the low voltage key sequence. With power the
++ * target is power cycled.
++ */
++int icsp_enter_programming(void);
++
++/**
++ * Leave programming mode; the target leaves reset. With keep_power the
++ * target supply stays on.
++ */
++int icsp_exit_programming(bool keep_power);
++
++/* ---- Debug executive link ------------------------------------------------ */
++
++/** The executive is waiting for a byte (target halted in debug mode). */
++int icsp_icd_ready(bool *ready);
++
++/** Send bytes, then optionally receive rx_len bytes (queued, flushed). */
++int icsp_icd_xfer(const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t rx_len);
++
++/** Queue ICD_TX of tx (at most 60 bytes) and ICD_RX of rx_len bytes. */
++int icsp_icd_queue(const uint8_t *tx, size_t tx_len, size_t rx_len);
++
++/* ---- Settings ------------------------------------------------------------ */
++
++/** Settings of the selected adapter driver (never NULL once it is initialised). */
++const struct icsp_config *icsp_get_config(void);
++
++#endif /* OPENOCD_JTAG_ICSP_H */
+diff --git a/src/jtag/interface.h b/src/jtag/interface.h
+index a8d9ee4..ca41fb3 100644
+--- a/src/jtag/interface.h
++++ b/src/jtag/interface.h
+@@ -16,6 +16,7 @@
+ 
+ #include <jtag/jtag.h>
+ #include <jtag/swim.h>
++#include <jtag/icsp.h>
+ #include <target/arm_tpiu_swo.h>
+ 
+ /* @file
+@@ -352,6 +353,9 @@ struct adapter_driver {
+ 
+ 	/* SWIM APIs */
+ 	const struct swim_driver *swim_ops;
++
++	/* ICSP APIs (PIC16F1) */
++	const struct icsp_driver *icsp_ops;
+ };
+ 
+ extern const char * const jtag_only[];
+diff --git a/src/jtag/interfaces.c b/src/jtag/interfaces.c
+index 67bbb3b..cc8c2c5 100644
+--- a/src/jtag/interfaces.c
++++ b/src/jtag/interfaces.c
+@@ -46,6 +46,9 @@ extern struct adapter_driver usb_blaster_adapter_driver;
+ #if BUILD_ESP_USB_JTAG == 1
+ extern struct adapter_driver esp_usb_adapter_driver;
+ #endif
++#if BUILD_PK2ICSP == 1
++extern struct adapter_driver pk2icsp_adapter_driver;
++#endif
+ #if BUILD_JTAG_VPI == 1
+ extern struct adapter_driver jtag_vpi_adapter_driver;
+ #endif
+@@ -166,6 +169,9 @@ struct adapter_driver *adapter_drivers[] = {
+ #if BUILD_ESP_USB_JTAG == 1
+ 		&esp_usb_adapter_driver,
+ #endif
++#if BUILD_PK2ICSP == 1
++		&pk2icsp_adapter_driver,
++#endif
+ #if BUILD_JTAG_VPI == 1
+ 		&jtag_vpi_adapter_driver,
+ #endif
+diff --git a/src/target/Makefile.am b/src/target/Makefile.am
+index 4687092..32e0fb5 100644
+--- a/src/target/Makefile.am
++++ b/src/target/Makefile.am
+@@ -21,6 +21,7 @@ noinst_LTLIBRARIES += %D%/libtarget.la
+ 	$(MIPS32_SRC) \
+ 	$(NDS32_SRC) \
+ 	$(STM8_SRC) \
++	$(PIC16F1_SRC) \
+ 	$(INTEL_IA32_SRC) \
+ 	$(ESIRISC_SRC) \
+         $(ARC_SRC) \
+@@ -149,6 +150,10 @@ NDS32_SRC = \
+ STM8_SRC = \
+ 	%D%/stm8.c
+ 
++PIC16F1_SRC = \
++	%D%/pic16f1.c \
++	%D%/pic16f1_icsp.c
++
+ INTEL_IA32_SRC = \
+ 	%D%/quark_x10xx.c \
+ 	%D%/quark_d20xx.c \
+@@ -249,6 +254,8 @@ ARC_SRC = \
+ 	%D%/nds32_aice.h \
+ 	%D%/semihosting_common.h \
+ 	%D%/stm8.h \
++	%D%/pic16f1_icsp.h \
++	%D%/pic16f1_exec.h \
+ 	%D%/lakemont.h \
+ 	%D%/x86_32_common.h \
+ 	%D%/arm_cti.h \
+diff --git a/src/target/pic16f1.c b/src/target/pic16f1.c
+new file mode 100644
+index 0000000..5a4266f
+--- /dev/null
++++ b/src/target/pic16f1.c
+@@ -0,0 +1,1180 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++/*
++ * Target driver for Microchip PIC16(L)F193x with an on-chip debug executive,
++ * through the icsp transport (PICkit 2 ICSP probe).
++ *
++ * How the on-chip debug of these parts works is documented in docs/icd.md of
++ * the probe project; this driver is a C port of Debugger in host/icd16f1.py.
++ * Summary:
++ *
++ *  - The part is programmed with DEBUG enabled and a small debug executive
++ *    in the debug space (0x8010-0x80FF). "pic16f1 load_debug" does that.
++ *  - The core enters the executive on a hardware breakpoint, on the opcodes
++ *    0x0002/0x0003, or when ICSPCLK is driven high. The executive waits for
++ *    commands from the probe (read byte, write byte, resume).
++ *  - The target is halted when the executive waits (ICD_READY).
++ *
++ * Address convention
++ * ------------------
++ *  - Code addresses are BYTE addresses as in HEX files: byte address = 2 *
++ *    word address. Program flash is at 0, so the flash bank (base 0), the
++ *    breakpoints (bp 0x40 2 hw) and the pc register all use it. The pc
++ *    register is the byte address of the next instruction (2 * PC).
++ *  - Data memory is at 0x800000 + address, where address is the
++ *    register-file address 0x000-0xFFF (bank * 0x80 + offset) or a linear
++ *    address 0x2000 and up, as the CPU sees it.
++ *  - Program memory cannot be read from a running debug session.
++ *
++ * The hardware breakpoint halts AFTER the instruction at its address has
++ * executed (skid of one instruction). There is one breakpoint, and single
++ * step uses it. The program counter cannot be changed.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <jtag/icsp.h>
++#include <helper/binarybuffer.h>
++#include <helper/log.h>
++#include <helper/command.h>
++#include <helper/time_support.h>
++#include "target.h"
++#include "target_type.h"
++#include "register.h"
++#include "breakpoints.h"
++#include "image.h"
++#include "pic16f1_icsp.h"
++#include "pic16f1_exec.h"
++
++#define PIC16F1_MAGIC       0x50313646U
++#define DATA_BASE           0x800000
++#define DATA_SPACE          0x10000
++
++/* Executive commands */
++#define CMD_READ   0x01
++#define CMD_WRITE  0x02
++#define CMD_GO     0x03
++
++/* Debug registers (bank 31) and other places the user's state lives */
++#define REG_PCL       0xF90
++#define REG_PCH       0xF91
++#define REG_BSR       0xFE3
++#define REG_STKPTR    0xFED
++#define REG_PCLATH    0x00A
++#define BREAK_ENABLE  0x80
++
++#define SAVE_W        PIC16F1_SAVE_W
++#define SAVE_STATUS   PIC16F1_SAVE_STATUS
++#define SAVE_FSR0L    (PIC16F1_SAVE_FSR0L + 0)
++#define SAVE_FSR0H    (PIC16F1_SAVE_FSR0L + 1)
++#define SAVE_FSR1L    (PIC16F1_SAVE_FSR0L + 2)
++#define SAVE_FSR1H    (PIC16F1_SAVE_FSR0L + 3)
++
++enum pic16f1_reg {
++	R_PC, R_W, R_STATUS, R_BSR, R_PCLATH, R_FSR0, R_FSR1, R_STKPTR,
++	NUM_REGS
++};
++
++static const struct {
++	const char *name;
++	unsigned int bits;
++} reg_info[NUM_REGS] = {
++	[R_PC] = { "pc", 16 },
++	[R_W] = { "w", 8 },
++	[R_STATUS] = { "status", 8 },
++	[R_BSR] = { "bsr", 8 },
++	[R_PCLATH] = { "pclath", 8 },
++	[R_FSR0] = { "fsr0", 16 },
++	[R_FSR1] = { "fsr1", 16 },
++	[R_STKPTR] = { "stkptr", 8 },
++};
++
++struct pic16f1_common {
++	unsigned int magic;
++	struct reg_cache *cache;
++	struct breakpoint *bp;       /* the hardware breakpoint, if set */
++	bool halt_requested;
++	bool bp_armed;               /* the last resume armed the breakpoint */
++};
++
++struct pic16f1_reg_arch {
++	struct target *target;
++	enum pic16f1_reg id;
++};
++
++static struct pic16f1_common *pic(struct target *target)
++{
++	return target->arch_info;
++}
++
++/* ---- Debug link ------------------------------------------------------------ */
++
++static int link_error(const char *what)
++{
++	LOG_ERROR("pic16f1: lost contact with the debug executive (%s)", what);
++	return ERROR_TARGET_FAILURE;
++}
++
++static int exec_read_batch(const uint32_t *addrs, unsigned int n, uint8_t *out)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return link_error("flush");
++	for (unsigned int i = 0; i < n; i++) {
++		const uint8_t tx[] = { CMD_READ, addrs[i] & 0xFF, addrs[i] >> 8 };
++		retval = icsp_icd_queue(tx, sizeof(tx), 1);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	retval = icsp_flush(out, n);
++	if (retval != ERROR_OK)
++		return link_error("read");
++	return ERROR_OK;
++}
++
++static int exec_read8(uint32_t addr, uint8_t *value)
++{
++	return exec_read_batch(&addr, 1, value);
++}
++
++static int exec_write8(uint32_t addr, uint8_t value)
++{
++	const uint8_t tx[] = { CMD_WRITE, addr & 0xFF, addr >> 8, value };
++	int retval = icsp_icd_xfer(tx, sizeof(tx), NULL, 0);
++	if (retval != ERROR_OK)
++		return link_error("write");
++	return ERROR_OK;
++}
++
++static int exec_go(void)
++{
++	const uint8_t tx[] = { CMD_GO };
++	int retval = icsp_icd_xfer(tx, sizeof(tx), NULL, 0);
++	if (retval != ERROR_OK)
++		return link_error("resume");
++	return ERROR_OK;
++}
++
++static int icd_wait_ready(unsigned int timeout_ms, bool *ready)
++{
++	int64_t end = timeval_ms() + timeout_ms;
++
++	for (;;) {
++		int retval = icsp_icd_ready(ready);
++		if (retval != ERROR_OK)
++			return retval;
++		if (*ready || timeval_ms() > end)
++			return ERROR_OK;
++		alive_sleep(2);
++	}
++}
++
++static int set_breakpoint_hw(uint32_t word_addr)
++{
++	int retval = exec_write8(REG_PCL, word_addr & 0xFF);
++	if (retval == ERROR_OK)
++		retval = exec_write8(REG_PCH, ((word_addr >> 8) & 0x7F) | BREAK_ENABLE);
++	return retval;
++}
++
++static int clear_breakpoint_hw(void)
++{
++	uint8_t v;
++	int retval = exec_read8(REG_PCH, &v);
++	if (retval == ERROR_OK)
++		retval = exec_write8(REG_PCH, v & ~BREAK_ENABLE);
++	return retval;
++}
++
++/* ---- Registers --------------------------------------------------------------- */
++
++static uint8_t swap_nibbles(uint8_t v)
++{
++	return (v << 4) | (v >> 4);
++}
++
++static void reg_store(struct target *target, enum pic16f1_reg id, uint32_t value)
++{
++	struct reg *r = &pic(target)->cache->reg_list[id];
++
++	buf_set_u32(r->value, 0, r->size, value);
++	r->valid = true;
++	r->dirty = false;
++}
++
++static int read_all_regs(struct target *target)
++{
++	static const uint32_t addrs[] = {
++		REG_PCL, REG_PCH, SAVE_W, SAVE_STATUS, REG_BSR, REG_PCLATH,
++		SAVE_FSR0L, SAVE_FSR0H, SAVE_FSR1L, SAVE_FSR1H, REG_STKPTR,
++	};
++	uint8_t v[ARRAY_SIZE(addrs)];
++
++	int retval = exec_read_batch(addrs, ARRAY_SIZE(addrs), v);
++	if (retval != ERROR_OK)
++		return retval;
++	reg_store(target, R_PC, 2 * (v[0] | ((v[1] & 0x7F) << 8)));
++	reg_store(target, R_W, v[2]);
++	reg_store(target, R_STATUS, swap_nibbles(v[3]));
++	reg_store(target, R_BSR, v[4] & 0x1F);
++	reg_store(target, R_PCLATH, v[5] & 0x7F);
++	reg_store(target, R_FSR0, v[6] | (v[7] << 8));
++	reg_store(target, R_FSR1, v[8] | (v[9] << 8));
++	reg_store(target, R_STKPTR, v[10] & 0x1F);
++	return ERROR_OK;
++}
++
++static int read_pc_word(struct target *target, uint32_t *word_pc)
++{
++	struct reg *r = &pic(target)->cache->reg_list[R_PC];
++	uint8_t v[2];
++	static const uint32_t addrs[] = { REG_PCL, REG_PCH };
++
++	if (r->valid) {
++		*word_pc = buf_get_u32(r->value, 0, 16) / 2;
++		return ERROR_OK;
++	}
++	int retval = exec_read_batch(addrs, 2, v);
++	if (retval != ERROR_OK)
++		return retval;
++	*word_pc = v[0] | ((v[1] & 0x7F) << 8);
++	reg_store(target, R_PC, 2 * *word_pc);
++	return ERROR_OK;
++}
++
++static int pic16f1_get_reg(struct reg *reg)
++{
++	struct pic16f1_reg_arch *a = reg->arch_info;
++	struct target *target = a->target;
++
++	if (target->state != TARGET_HALTED)
++		return ERROR_TARGET_NOT_HALTED;
++	if (reg->valid)
++		return ERROR_OK;
++	if (a->id == R_PC) {
++		uint32_t pc;
++		return read_pc_word(target, &pc);
++	}
++	return read_all_regs(target);
++}
++
++static int pic16f1_set_reg(struct reg *reg, uint8_t *buf)
++{
++	struct pic16f1_reg_arch *a = reg->arch_info;
++	struct target *target = a->target;
++	uint32_t v = buf_get_u32(buf, 0, reg->size);
++	int retval = ERROR_OK;
++
++	if (target->state != TARGET_HALTED)
++		return ERROR_TARGET_NOT_HALTED;
++
++	switch (a->id) {
++	case R_PC:
++		LOG_ERROR("pic16f1: the program counter of a halted target cannot be changed");
++		return ERROR_FAIL;
++	case R_W:
++		retval = exec_write8(SAVE_W, v);
++		break;
++	case R_STATUS:
++		retval = exec_write8(SAVE_STATUS, swap_nibbles(v));
++		break;
++	case R_BSR:
++		retval = exec_write8(REG_BSR, v & 0x1F);
++		break;
++	case R_PCLATH:
++		retval = exec_write8(REG_PCLATH, v & 0x7F);
++		break;
++	case R_FSR0:
++		retval = exec_write8(SAVE_FSR0L, v & 0xFF);
++		if (retval == ERROR_OK)
++			retval = exec_write8(SAVE_FSR0H, v >> 8);
++		break;
++	case R_FSR1:
++		retval = exec_write8(SAVE_FSR1L, v & 0xFF);
++		if (retval == ERROR_OK)
++			retval = exec_write8(SAVE_FSR1H, v >> 8);
++		break;
++	case R_STKPTR:
++		retval = exec_write8(REG_STKPTR, v & 0x1F);
++		break;
++	default:
++		return ERROR_FAIL;
++	}
++	if (retval != ERROR_OK)
++		return retval;
++	buf_set_u32(reg->value, 0, reg->size, v);
++	reg->valid = true;
++	reg->dirty = false;
++	return ERROR_OK;
++}
++
++static const struct reg_arch_type pic16f1_reg_type = {
++	.get = pic16f1_get_reg,
++	.set = pic16f1_set_reg,
++};
++
++static struct reg_cache *pic16f1_build_reg_cache(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	struct reg_cache **cache_p = register_get_last_cache_p(&target->reg_cache);
++	struct reg_cache *cache = calloc(1, sizeof(*cache));
++	struct reg *list = calloc(NUM_REGS, sizeof(*list));
++	struct pic16f1_reg_arch *arch = calloc(NUM_REGS, sizeof(*arch));
++
++	if (!cache || !list || !arch)
++		return NULL;
++	cache->name = "pic16f1 registers";
++	cache->reg_list = list;
++	cache->num_regs = NUM_REGS;
++	*cache_p = cache;
++	p->cache = cache;
++
++	for (unsigned int i = 0; i < NUM_REGS; i++) {
++		arch[i].target = target;
++		arch[i].id = i;
++		list[i].name = reg_info[i].name;
++		list[i].size = reg_info[i].bits;
++		list[i].value = calloc(1, 4);
++		list[i].valid = false;
++		list[i].dirty = false;
++		list[i].exist = true;
++		list[i].type = &pic16f1_reg_type;
++		list[i].arch_info = &arch[i];
++		list[i].group = "general";
++		list[i].number = i;
++		list[i].reg_data_type = calloc(1, sizeof(struct reg_data_type));
++		if (list[i].reg_data_type)
++			list[i].reg_data_type->type = reg_info[i].bits == 16 ? REG_TYPE_UINT16 : REG_TYPE_UINT8;
++		list[i].feature = calloc(1, sizeof(struct reg_feature));
++		if (list[i].feature)
++			list[i].feature->name = "org.gnu.gdb.pic16f1.core";
++	}
++	return cache;
++}
++
++static int pic16f1_get_gdb_reg_list(struct target *target, struct reg **reg_list[],
++		int *reg_list_size, enum target_register_class reg_class)
++{
++	struct pic16f1_common *p = pic(target);
++
++	*reg_list_size = NUM_REGS;
++	*reg_list = malloc(sizeof(struct reg *) * NUM_REGS);
++	if (!*reg_list)
++		return ERROR_FAIL;
++	for (unsigned int i = 0; i < NUM_REGS; i++)
++		(*reg_list)[i] = &p->cache->reg_list[i];
++	return ERROR_OK;
++}
++
++/* ---- State ------------------------------------------------------------------- */
++
++static void debug_entry(struct target *target, enum target_debug_reason reason)
++{
++	register_cache_invalidate(pic(target)->cache);
++	target->state = TARGET_HALTED;
++	target->debug_reason = reason;
++	/* fill the register cache now, so that "reg" shows values */
++	if (read_all_regs(target) != ERROR_OK)
++		LOG_WARNING("pic16f1: could not read the registers");
++}
++
++void pic16f1_target_link_lost(struct target *target)
++{
++	if (!target || target->type->name == NULL || strcmp(target->type->name, "pic16f1"))
++		return;
++	register_cache_invalidate(pic(target)->cache);
++	target->state = TARGET_UNKNOWN;
++	pic(target)->bp_armed = false;
++}
++
++static int pic16f1_poll(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	bool ready;
++
++	int retval = icsp_icd_ready(&ready);
++	if (retval != ERROR_OK)
++		return ERROR_OK;   /* try again at the next poll */
++
++	if (ready) {
++		if (target->state != TARGET_HALTED) {
++			enum target_debug_reason reason = p->bp_armed ?
++				DBG_REASON_BREAKPOINT : DBG_REASON_DBGRQ;
++			bool was_debug_running = target->state == TARGET_DEBUG_RUNNING;
++
++			p->bp_armed = false;
++			p->halt_requested = false;
++			debug_entry(target, reason);
++			target_call_event_callbacks(target, was_debug_running ?
++				TARGET_EVENT_DEBUG_HALTED : TARGET_EVENT_HALTED);
++		}
++	} else if (target->state != TARGET_RUNNING && target->state != TARGET_DEBUG_RUNNING) {
++		/* not waiting for commands: user code runs (or the target is not
++		 * programmed for debugging) */
++		if (target->state == TARGET_HALTED)
++			LOG_WARNING("pic16f1: the target left the halted state by itself");
++		target->state = TARGET_RUNNING;
++		target->debug_reason = DBG_REASON_NOTHALTED;
++		register_cache_invalidate(p->cache);
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_halt(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	bool ready;
++
++	if (target->state == TARGET_HALTED)
++		return ERROR_OK;
++	if (target->state == TARGET_UNKNOWN)
++		pic16f1_poll(target);
++	if (target->state == TARGET_HALTED)
++		return ERROR_OK;
++
++	/* ICSPCLK high for 200 us, then released */
++	icsp_pins(ICSP_PIN_CLK | ICSP_PIN_DAT_IN);
++	icsp_delay_us(200);
++	icsp_pins(ICSP_PINS_IDLE);
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = icd_wait_ready(500, &ready);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!ready) {
++		LOG_ERROR("pic16f1: the target did not halt; is it programmed for debugging "
++			"(pic16f1 load_debug) and powered?");
++		return ERROR_TARGET_FAILURE;
++	}
++	p->bp_armed = false;
++	debug_entry(target, DBG_REASON_DBGRQ);
++	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
++	return ERROR_OK;
++}
++
++static int resume_common(struct target *target, bool debug_execution)
++{
++	struct pic16f1_common *p = pic(target);
++	int retval;
++
++	if (p->bp) {
++		retval = set_breakpoint_hw(p->bp->address / 2);
++		p->bp_armed = true;
++	} else {
++		retval = clear_breakpoint_hw();
++		p->bp_armed = false;
++	}
++	if (retval == ERROR_OK)
++		retval = exec_go();
++	if (retval != ERROR_OK)
++		return retval;
++
++	register_cache_invalidate(p->cache);
++	target->state = debug_execution ? TARGET_DEBUG_RUNNING : TARGET_RUNNING;
++	target->debug_reason = DBG_REASON_NOTHALTED;
++	return ERROR_OK;
++}
++
++static int pic16f1_resume(struct target *target, int current, target_addr_t address,
++		int handle_breakpoints, int debug_execution)
++{
++	if (target->state != TARGET_HALTED) {
++		LOG_WARNING("pic16f1: target not halted");
++		return ERROR_TARGET_NOT_HALTED;
++	}
++	if (!current) {
++		LOG_ERROR("pic16f1: the program counter cannot be changed, resume from the current pc");
++		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++
++	int retval = resume_common(target, debug_execution);
++	if (retval != ERROR_OK)
++		return retval;
++	target_call_event_callbacks(target, debug_execution ?
++		TARGET_EVENT_DEBUG_RESUMED : TARGET_EVENT_RESUMED);
++	return ERROR_OK;
++}
++
++static int pic16f1_step(struct target *target, int current, target_addr_t address,
++		int handle_breakpoints)
++{
++	struct pic16f1_common *p = pic(target);
++	uint32_t pc;
++	bool ready;
++
++	if (target->state != TARGET_HALTED) {
++		LOG_WARNING("pic16f1: target not halted");
++		return ERROR_TARGET_NOT_HALTED;
++	}
++	if (!current) {
++		LOG_ERROR("pic16f1: the program counter cannot be changed, step from the current pc");
++		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++
++	int retval = read_pc_word(target, &pc);
++	if (retval != ERROR_OK)
++		return retval;
++
++	/* A breakpoint on the current instruction: exactly one instruction runs */
++	retval = set_breakpoint_hw(pc);
++	if (retval == ERROR_OK)
++		retval = exec_go();
++	if (retval != ERROR_OK)
++		return retval;
++
++	register_cache_invalidate(p->cache);
++	target->state = TARGET_RUNNING;
++	target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
++
++	retval = icd_wait_ready(1000, &ready);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!ready) {
++		LOG_ERROR("pic16f1: the target did not come back from a single step");
++		return ERROR_TARGET_FAILURE;
++	}
++	p->bp_armed = false;
++	debug_entry(target, DBG_REASON_SINGLESTEP);
++	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
++	return ERROR_OK;
++}
++
++/*
++ * Reset, as Debugger.reset(): MCLR has no effect while the executive runs, so
++ * the target is resumed with the breakpoint on address 0 and then reset; the
++ * breakpoint register survives the reset. If MCLR is not a reset input (the
++ * configuration words can make it a digital input) and the probe powers the
++ * target, the target is power cycled instead, which arms the same breakpoint.
++ */
++static int reset_to_vector(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	const struct icsp_config *c = icsp_get_config();
++	bool ready;
++	int retval;
++
++	if (target->state != TARGET_HALTED) {
++		retval = pic16f1_halt(target);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	retval = set_breakpoint_hw(0);
++	if (retval == ERROR_OK)
++		retval = exec_go();
++	if (retval != ERROR_OK)
++		return retval;
++	register_cache_invalidate(p->cache);
++	target->state = TARGET_RESET;
++
++	/*
++	 * The executive needs time to restore the registers and leave debug
++	 * mode, in which MCLR is ignored: about 0.3 ms at the 500 kHz reset
++	 * clock, more on a 31 kHz clock.
++	 */
++	icsp_delay_ms(10);
++	icsp_mclr(ICSP_MCLR_GROUND);
++	icsp_delay_ms(2);
++	icsp_pins(ICSP_PINS_IDLE);
++	icsp_mclr(ICSP_MCLR_RELEASE);
++	retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++
++	retval = icd_wait_ready(500, &ready);
++	if (retval == ERROR_OK && ready) {
++		uint32_t pc;
++		register_cache_invalidate(p->cache);
++		retval = read_pc_word(target, &pc);
++		if (retval == ERROR_OK && pc <= 1) {
++			exec_write8(REG_BSR, 0);   /* the saved copy is not cleared by the reset */
++			return ERROR_OK;
++		}
++	}
++
++	if (!c || !c->power) {
++		LOG_ERROR("pic16f1: the target did not stop after an MCLR reset");
++		return ERROR_TARGET_FAILURE;
++	}
++	LOG_INFO("pic16f1: MCLR reset had no effect, power cycling the target");
++	icsp_pins(ICSP_PINS_IDLE);
++	icsp_vdd_mode(ICSP_VDD_DISCHARGE);
++	icsp_delay_ms(100);
++	icsp_vdd_mode(ICSP_VDD_OFF);
++	icsp_vdd_mode(ICSP_VDD_ON);
++	retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = icd_wait_ready(1000, &ready);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!ready) {
++		LOG_ERROR("pic16f1: the target did not stop after a power cycle");
++		return ERROR_TARGET_FAILURE;
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_assert_reset(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++
++	/* the debug registers keep a stale breakpoint over a reset; forget ours */
++	int retval = reset_to_vector(target);
++	if (retval != ERROR_OK) {
++		target->state = TARGET_UNKNOWN;
++		return retval;
++	}
++	p->bp_armed = false;
++	debug_entry(target, DBG_REASON_DBGRQ);
++
++	if (!target->reset_halt) {
++		/* reset run: let it go from the reset vector */
++		retval = resume_common(target, false);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_deassert_reset(struct target *target)
++{
++	if (target->reset_halt && target->state == TARGET_HALTED)
++		target_call_event_callbacks(target, TARGET_EVENT_HALTED);
++	return ERROR_OK;
++}
++
++/* ---- Breakpoints --------------------------------------------------------------- */
++
++static int pic16f1_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
++{
++	struct pic16f1_common *p = pic(target);
++
++	if (target->state != TARGET_HALTED)
++		return ERROR_TARGET_NOT_HALTED;
++	if (breakpoint->type != BKPT_HARD) {
++		LOG_ERROR("pic16f1: only a hardware breakpoint is available (bp <addr> 2 hw; "
++			"for gdb use 'gdb_breakpoint_override hard')");
++		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++	if (breakpoint->address & 1 || breakpoint->address >= 0x10000) {
++		LOG_ERROR("pic16f1: breakpoint address must be an even byte address (2 * word address) below 0x10000");
++		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++	if (p->bp) {
++		LOG_ERROR("pic16f1: there is only one hardware breakpoint");
++		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++	p->bp = breakpoint;
++	breakpoint->is_set = true;
++	LOG_INFO("pic16f1: the target halts AFTER the instruction at 0x%" TARGET_PRIxADDR
++		" has executed", breakpoint->address);
++	return ERROR_OK;
++}
++
++static int pic16f1_remove_breakpoint(struct target *target, struct breakpoint *breakpoint)
++{
++	struct pic16f1_common *p = pic(target);
++
++	if (p->bp == breakpoint)
++		p->bp = NULL;
++	breakpoint->is_set = false;
++	return ERROR_OK;
++}
++
++/* ---- Memory ------------------------------------------------------------------- */
++
++/* Where the user's value of a core register lives while halted (Debugger._map) */
++static uint32_t map_addr(uint32_t addr)
++{
++	if (addr < 0x1000) {
++		switch (addr & 0x7F) {
++		case 0x04: return SAVE_FSR0L;
++		case 0x05: return SAVE_FSR0H;
++		case 0x06: return SAVE_FSR1L;
++		case 0x07: return SAVE_FSR1H;
++		case 0x08: return REG_BSR;
++		case 0x09: return SAVE_W;
++		default:
++			if ((addr & 0x7F) < 0x0C)
++				return addr & 0x7F;   /* other core registers: any bank will do */
++		}
++	}
++	return addr;
++}
++
++static int check_data_access(struct target *target, target_addr_t address, uint32_t bytes)
++{
++	if (target->state != TARGET_HALTED) {
++		LOG_ERROR("pic16f1: target not halted");
++		return ERROR_TARGET_NOT_HALTED;
++	}
++	if (address < DATA_BASE) {
++		LOG_ERROR("pic16f1: address 0x%" TARGET_PRIxADDR " is program memory, which cannot "
++			"be accessed during a debug session; data memory is at 0x%x + address "
++			"(use 'flash read_bank' for program memory)", address, DATA_BASE);
++		return ERROR_FAIL;
++	}
++	if (address - DATA_BASE + bytes > DATA_SPACE) {
++		LOG_ERROR("pic16f1: data address out of range");
++		return ERROR_FAIL;
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_read_memory(struct target *target, target_addr_t address,
++		uint32_t size, uint32_t count, uint8_t *buffer)
++{
++	uint32_t total = size * count;
++	int retval = check_data_access(target, address, total);
++	if (retval != ERROR_OK)
++		return retval;
++
++	uint32_t base = address - DATA_BASE;
++	uint32_t pc_word = 0;
++	bool have_pc = false;
++
++	for (uint32_t done = 0; done < total;) {
++		uint32_t n = MIN(total - done, 24U);
++		uint32_t addrs[24];
++		uint8_t v[24];
++
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t a = base + done + i;
++			if (a < 0x1000 && (a & 0x7F) == 0x03)
++				addrs[i] = SAVE_STATUS;
++			else if (a < 0x1000 && (a & 0x7F) == 0x02)
++				addrs[i] = REG_PCL;       /* the PC at the halt, not the shadow of PCL */
++			else
++				addrs[i] = map_addr(a);
++		}
++		retval = exec_read_batch(addrs, n, v);
++		if (retval != ERROR_OK)
++			return retval;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t a = base + done + i;
++			if (a < 0x1000 && (a & 0x7F) == 0x03) {
++				v[i] = swap_nibbles(v[i]);
++			} else if (a < 0x1000 && (a & 0x7F) == 0x02) {
++				if (!have_pc) {
++					retval = read_pc_word(target, &pc_word);
++					if (retval != ERROR_OK)
++						return retval;
++					have_pc = true;
++				}
++				v[i] = pc_word & 0xFF;
++			}
++			buffer[done + i] = v[i];
++		}
++		done += n;
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_write_memory(struct target *target, target_addr_t address,
++		uint32_t size, uint32_t count, const uint8_t *buffer)
++{
++	uint32_t total = size * count;
++	int retval = check_data_access(target, address, total);
++	if (retval != ERROR_OK)
++		return retval;
++
++	uint32_t base = address - DATA_BASE;
++
++	for (uint32_t i = 0; i < total; i++) {
++		uint32_t a = base + i;
++		if (a < 0x1000 && (a & 0x7F) == 0x02) {
++			LOG_ERROR("pic16f1: the program counter of a halted target cannot be changed");
++			return ERROR_FAIL;
++		}
++	}
++	for (uint32_t done = 0; done < total;) {
++		uint32_t n = MIN(total - done, 7U);
++
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t a = base + done + i;
++			uint8_t value = buffer[done + i];
++			uint32_t dst;
++
++			if (a < 0x1000 && (a & 0x7F) == 0x03) {
++				dst = SAVE_STATUS;
++				value = swap_nibbles(value);
++			} else {
++				dst = map_addr(a);
++			}
++			const uint8_t tx[] = { CMD_WRITE, dst & 0xFF, dst >> 8, value };
++			retval = icsp_icd_queue(tx, sizeof(tx), 0);
++			if (retval != ERROR_OK)
++				return retval;
++		}
++		retval = icsp_flush(NULL, 0);
++		if (retval != ERROR_OK)
++			return link_error("write");
++		done += n;
++	}
++	/* cached copies of core registers may have changed */
++	for (uint32_t i = 0; i < total; i++) {
++		uint32_t a = base + i;
++		if ((a < 0x1000 && (a & 0x7F) < 0x0C) || (a >= 0x320 && a < 0x330) ||
++				a == REG_PCL || a == REG_PCH || a == REG_BSR || a == REG_STKPTR) {
++			register_cache_invalidate(pic(target)->cache);
++			if (read_all_regs(target) != ERROR_OK)
++				LOG_WARNING("pic16f1: could not read the registers");
++			break;
++		}
++	}
++	return ERROR_OK;
++}
++
++/* ---- Debug load ---------------------------------------------------------------- */
++
++static int write_sparse_config(const struct pic16f1_exec_word *w, unsigned int n)
++{
++	unsigned int i = 0;
++
++	while (i < n) {
++		uint16_t run[256];
++		unsigned int len = 0;
++		uint32_t start = w[i].addr;
++
++		while (i < n && w[i].addr == start + len && len < ARRAY_SIZE(run))
++			run[len++] = w[i++].word;
++		int retval = pic16f1_write_config_words(start, run, len);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	return ERROR_OK;
++}
++
++static int erase_exec_rows(void)
++{
++	for (uint32_t row = 0x8020; row < PIC16F1_EXEC_END; row += 0x20) {
++		int retval = pic16f1_row_erase(row);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	return ERROR_OK;
++}
++
++static int verify_words(uint32_t addr, const uint16_t *want, unsigned int count, const char *what)
++{
++	uint16_t *back = malloc(count * sizeof(uint16_t));
++	int errors = 0;
++
++	if (!back)
++		return ERROR_FAIL;
++	int retval = pic16f1_read_words(addr, count, back);
++	if (retval == ERROR_OK) {
++		for (unsigned int i = 0; i < count; i++) {
++			if (back[i] != want[i]) {
++				if (errors++ < 5)
++					LOG_ERROR("pic16f1: %s 0x%04" PRIx32 ": wrote 0x%04x, read 0x%04x",
++						what, addr + i, want[i], back[i]);
++			}
++		}
++		if (errors)
++			retval = ERROR_FAIL;
++	}
++	free(back);
++	return retval;
++}
++
++static int do_load_debug(struct target *target, struct image *image)
++{
++	const struct pic16f1_device *dev;
++	struct pic16f1_image img;
++	int retval;
++
++	retval = pic16f1_connect(&dev, NULL, NULL);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!dev->debug) {
++		LOG_ERROR("pic16f1: debugging is only supported for the PIC16(L)F193x, found %s", dev->name);
++		pic16f1_disconnect();
++		return ERROR_FAIL;
++	}
++	LOG_INFO("pic16f1: loading %s for debugging", dev->name);
++
++	retval = pic16f1_image_split(image, dev, &img);
++	if (retval != ERROR_OK) {
++		pic16f1_disconnect();
++		return retval;
++	}
++	if (!img.cfg_present[PIC16F1_CONFIG2_ADDR - 0x8000]) {
++		LOG_ERROR("pic16f1: the image has no configuration words");
++		retval = ERROR_FAIL;
++		goto done;
++	}
++	img.cfg[PIC16F1_CONFIG2_ADDR - 0x8000] &= ~PIC16F1_CONFIG2_DEBUG;
++
++	retval = pic16f1_bulk_erase(dev);
++	if (retval == ERROR_OK)
++		retval = erase_exec_rows();
++	if (retval != ERROR_OK)
++		goto done;
++
++	/* flash up to the last used latch */
++	uint32_t top = 0;
++	for (uint32_t i = 0; i < dev->flash_words; i++)
++		if (img.flash[i] != PIC16F1_BLANK)
++			top = i + 1;
++	top = (top + dev->latches - 1) / dev->latches * dev->latches;
++	if (top) {
++		retval = pic16f1_write_flash(dev, 0, img.flash, top);
++		if (retval != ERROR_OK)
++			goto done;
++	}
++	if (img.has_ee) {
++		retval = pic16f1_write_eeprom(0, img.ee, dev->eeprom);
++		if (retval != ERROR_OK)
++			goto done;
++	}
++	/* user IDs */
++	for (unsigned int i = 0; i < PIC16F1_USERID_WORDS && retval == ERROR_OK; i++) {
++		if (img.cfg_present[i])
++			retval = pic16f1_write_config_words(PIC16F1_USERID_ADDR + i, &img.cfg[i], 1);
++	}
++	if (retval != ERROR_OK)
++		goto done;
++
++	/* verify what is there so far */
++	if (top)
++		retval = verify_words(0, img.flash, top, "flash");
++	for (unsigned int i = 0; i < PIC16F1_USERID_WORDS && retval == ERROR_OK; i++)
++		if (img.cfg_present[i])
++			retval = verify_words(PIC16F1_USERID_ADDR + i, &img.cfg[i], 1, "user id");
++	if (retval == ERROR_OK && img.has_ee) {
++		uint8_t back[PIC16F1_MAX_EEPROM];
++		retval = pic16f1_read_eeprom(dev->eeprom, back);
++		if (retval == ERROR_OK && memcmp(back, img.ee, dev->eeprom)) {
++			LOG_ERROR("pic16f1: EEPROM verify failed");
++			retval = ERROR_FAIL;
++		}
++	}
++	if (retval != ERROR_OK)
++		goto done;
++
++	/* the debug executive */
++	retval = write_sparse_config(pic16f1_exec, PIC16F1_EXEC_WORDS);
++	if (retval == ERROR_OK) {
++		uint32_t lo = pic16f1_exec[0].addr, hi = pic16f1_exec[PIC16F1_EXEC_WORDS - 1].addr;
++		uint16_t *back = malloc((hi - lo + 1) * sizeof(uint16_t));
++		if (!back) {
++			retval = ERROR_FAIL;
++			goto done;
++		}
++		retval = pic16f1_read_words(lo, hi - lo + 1, back);
++		for (unsigned int i = 0; retval == ERROR_OK && i < PIC16F1_EXEC_WORDS; i++) {
++			if (back[pic16f1_exec[i].addr - lo] != pic16f1_exec[i].word) {
++				LOG_ERROR("pic16f1: executive 0x%04x: wrote 0x%04x, read 0x%04x",
++					pic16f1_exec[i].addr, pic16f1_exec[i].word,
++					back[pic16f1_exec[i].addr - lo]);
++				retval = ERROR_FAIL;
++			}
++		}
++		free(back);
++	}
++	if (retval != ERROR_OK)
++		goto done;
++
++	/* configuration words last: DEBUG is enabled by this */
++	for (unsigned int i = 0; i < dev->config_words && retval == ERROR_OK; i++) {
++		uint32_t idx = PIC16F1_CONFIG_ADDR - 0x8000 + i;
++		if (!img.cfg_present[idx])
++			continue;
++		retval = pic16f1_write_config_words(0x8000 + idx, &img.cfg[idx], 1);
++		if (retval == ERROR_OK)
++			retval = verify_words(0x8000 + idx, &img.cfg[idx], 1, "config");
++	}
++done:
++	pic16f1_image_free(&img);
++	int r2 = pic16f1_disconnect();   /* the target leaves reset */
++	return retval != ERROR_OK ? retval : r2;
++}
++
++COMMAND_HANDLER(handle_pic16f1_load_debug_command)
++{
++	struct target *target = get_current_target(CMD_CTX);
++	struct image image;
++
++	if (CMD_ARGC != 1)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	int retval = image_open(&image, CMD_ARGV[0], "ihex");
++	if (retval != ERROR_OK)
++		return retval;
++
++	pic16f1_target_link_lost(target);
++	retval = do_load_debug(target, &image);
++	image_close(&image);
++	if (retval != ERROR_OK) {
++		command_print(CMD, "pic16f1: load_debug failed");
++		return retval;
++	}
++
++	/* The part runs; with DEBUG enabled a power-on stops it at the reset
++	 * vector. */
++	bool ready = false;
++	retval = icd_wait_ready(500, &ready);
++	if (retval == ERROR_OK && !ready) {
++		pic16f1_target_link_lost(target);
++		retval = pic16f1_halt(target);
++		if (retval != ERROR_OK)
++			return retval;
++	} else {
++		pic16f1_poll(target);
++	}
++	command_print(CMD, "target programmed for debugging, state: %s",
++		target_state_name(target));
++	return ERROR_OK;
++}
++
++COMMAND_HANDLER(handle_pic16f1_unload_debug_command)
++{
++	struct target *target = get_current_target(CMD_CTX);
++	const struct pic16f1_device *dev;
++
++	if (CMD_ARGC != 0)
++		return ERROR_COMMAND_SYNTAX_ERROR;
++
++	pic16f1_target_link_lost(target);
++	int retval = pic16f1_connect(&dev, NULL, NULL);
++	if (retval != ERROR_OK)
++		return retval;
++	retval = pic16f1_bulk_erase(dev);
++	if (retval == ERROR_OK)
++		retval = erase_exec_rows();
++	int r2 = pic16f1_disconnect();
++	if (retval == ERROR_OK)
++		retval = r2;
++	if (retval != ERROR_OK)
++		return retval;
++	command_print(CMD, "%s erased, debug executive removed", dev->name);
++	return ERROR_OK;
++}
++
++static const struct command_registration pic16f1_exec_command_handlers[] = {
++	{
++		.name = "load_debug",
++		.handler = handle_pic16f1_load_debug_command,
++		.mode = COMMAND_EXEC,
++		.help = "bulk erase, program an Intel HEX image together with the debug "
++			"executive and DEBUG enabled, release reset; the target ends halted "
++			"at the reset vector",
++		.usage = "hexfile",
++	},
++	{
++		.name = "unload_debug",
++		.handler = handle_pic16f1_unload_debug_command,
++		.mode = COMMAND_EXEC,
++		.help = "bulk erase the device and erase the debug executive rows",
++		.usage = "",
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++static const struct command_registration pic16f1_command_handlers[] = {
++	{
++		.name = "pic16f1",
++		.mode = COMMAND_ANY,
++		.help = "PIC16F1 target commands",
++		.usage = "",
++		.chain = pic16f1_exec_command_handlers,
++	},
++	COMMAND_REGISTRATION_DONE
++};
++
++/* ---- Target type ---------------------------------------------------------------- */
++
++static int pic16f1_target_create(struct target *target, Jim_Interp *interp)
++{
++	struct pic16f1_common *p = calloc(1, sizeof(*p));
++
++	if (!p)
++		return ERROR_FAIL;
++	p->magic = PIC16F1_MAGIC;
++	target->arch_info = p;
++	target->endianness = TARGET_LITTLE_ENDIAN;
++	return ERROR_OK;
++}
++
++static int pic16f1_init_target(struct command_context *cmd_ctx, struct target *target)
++{
++	if (!pic16f1_build_reg_cache(target))
++		return ERROR_FAIL;
++	return ERROR_OK;
++}
++
++static void pic16f1_deinit_target(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++
++	if (!p)
++		return;
++	if (p->cache) {
++		for (unsigned int i = 0; i < NUM_REGS; i++) {
++			free(p->cache->reg_list[i].value);
++			free(p->cache->reg_list[i].reg_data_type);
++			free(p->cache->reg_list[i].feature);
++		}
++		free(p->cache->reg_list[0].arch_info);
++		free(p->cache->reg_list);
++		free(p->cache);
++	}
++	free(p);
++	target->arch_info = NULL;
++}
++
++static int pic16f1_examine(struct target *target)
++{
++	if (!target_was_examined(target)) {
++		bool ready;
++		int retval = icsp_icd_ready(&ready);
++		if (retval != ERROR_OK)
++			return retval;
++		target_set_examined(target);
++		LOG_INFO("pic16f1: debug link %s", ready ? "ready, target halted" : "idle, target running (or not programmed for debugging)");
++	}
++	return ERROR_OK;
++}
++
++static int pic16f1_arch_state(struct target *target)
++{
++	struct reg *pc = &pic(target)->cache->reg_list[R_PC];
++
++	if (target->state == TARGET_HALTED && pc->valid)
++		LOG_USER("target halted due to %s, pc 0x%04" PRIx32 " (word address 0x%04" PRIx32 ")",
++			debug_reason_name(target),
++			buf_get_u32(pc->value, 0, 16), buf_get_u32(pc->value, 0, 16) / 2);
++	return ERROR_OK;
++}
++
++struct target_type pic16f1_target = {
++	.name = "pic16f1",
++
++	.poll = pic16f1_poll,
++	.arch_state = pic16f1_arch_state,
++
++	.halt = pic16f1_halt,
++	.resume = pic16f1_resume,
++	.step = pic16f1_step,
++
++	.assert_reset = pic16f1_assert_reset,
++	.deassert_reset = pic16f1_deassert_reset,
++
++	.get_gdb_reg_list = pic16f1_get_gdb_reg_list,
++
++	.read_memory = pic16f1_read_memory,
++	.write_memory = pic16f1_write_memory,
++
++	.add_breakpoint = pic16f1_add_breakpoint,
++	.remove_breakpoint = pic16f1_remove_breakpoint,
++
++	.commands = pic16f1_command_handlers,
++	.target_create = pic16f1_target_create,
++	.init_target = pic16f1_init_target,
++	.deinit_target = pic16f1_deinit_target,
++	.examine = pic16f1_examine,
++};
+diff --git a/src/target/pic16f1_exec.h b/src/target/pic16f1_exec.h
+new file mode 100644
+index 0000000..7e2714b
+--- /dev/null
++++ b/src/target/pic16f1_exec.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++/*
++ * Debug executive for PIC16(L)F193x on-chip debugging.
++ *
++ * GENERATED FILE, do not edit.  It is the output of build_executive() in
++ * host/icd16f1.py (assembler: host/asm14.py) of the PICkit 2 probe project.
++ * Regenerate with:
++ *     python3 openocd/gen_pic16f1_exec.py > src/target/pic16f1_exec.h
++ * (run from the project root; the interpreter needs pyusb because
++ * host/icd16f1.py imports host/pk2probe.py).
++ *
++ * 121 words, addresses are in the 0x8000 debug/configuration space.
++ */
++
++#ifndef OPENOCD_TARGET_PIC16F1_EXEC_H
++#define OPENOCD_TARGET_PIC16F1_EXEC_H
++
++#include <stdint.h>
++
++#define PIC16F1_DEBUG_VECTOR   0x8004
++#define PIC16F1_EXEC_START     0x8010
++#define PIC16F1_EXEC_END       0x8100  /* first address past the writable area */
++#define PIC16F1_SAVE_W         0x320
++#define PIC16F1_SAVE_STATUS    0x321  /* STATUS, nibbles swapped */
++#define PIC16F1_SAVE_FSR0L     0x322  /* FSR0L, FSR0H, FSR1L, FSR1H follow */
++
++struct pic16f1_exec_word {
++	uint16_t addr;
++	uint16_t word;
++};
++
++static const struct pic16f1_exec_word pic16f1_exec[121] = {
++	{ 0x8004, 0x2810 }, { 0x8010, 0x0026 }, { 0x8011, 0x00A0 }, { 0x8012, 0x0E03 },
++	{ 0x8013, 0x00A1 }, { 0x8014, 0x0804 }, { 0x8015, 0x00A2 }, { 0x8016, 0x0805 },
++	{ 0x8017, 0x00A3 }, { 0x8018, 0x0806 }, { 0x8019, 0x00A4 }, { 0x801A, 0x0807 },
++	{ 0x801B, 0x00A5 }, { 0x801C, 0x308C }, { 0x801D, 0x0086 }, { 0x801E, 0x300F },
++	{ 0x801F, 0x0087 }, { 0x8020, 0x2069 }, { 0x8021, 0x3A01 }, { 0x8022, 0x1903 },
++	{ 0x8023, 0x2839 }, { 0x8024, 0x3A03 }, { 0x8025, 0x1903 }, { 0x8026, 0x2840 },
++	{ 0x8027, 0x3A01 }, { 0x8028, 0x1D03 }, { 0x8029, 0x2820 }, { 0x802A, 0x300C },
++	{ 0x802B, 0x0081 }, { 0x802C, 0x0824 }, { 0x802D, 0x0086 }, { 0x802E, 0x0825 },
++	{ 0x802F, 0x0087 }, { 0x8030, 0x0822 }, { 0x8031, 0x0084 }, { 0x8032, 0x0823 },
++	{ 0x8033, 0x0085 }, { 0x8034, 0x0E21 }, { 0x8035, 0x0083 }, { 0x8036, 0x0EA0 },
++	{ 0x8037, 0x0E20 }, { 0x8038, 0x0004 }, { 0x8039, 0x2069 }, { 0x803A, 0x0084 },
++	{ 0x803B, 0x2069 }, { 0x803C, 0x0085 }, { 0x803D, 0x0800 }, { 0x803E, 0x2049 },
++	{ 0x803F, 0x2820 }, { 0x8040, 0x2069 }, { 0x8041, 0x0084 }, { 0x8042, 0x2069 },
++	{ 0x8043, 0x0085 }, { 0x8044, 0x2069 }, { 0x8045, 0x0080 }, { 0x8046, 0x0000 },
++	{ 0x8047, 0x0000 }, { 0x8048, 0x2820 }, { 0x8049, 0x00A6 }, { 0x804A, 0x3048 },
++	{ 0x804B, 0x0081 }, { 0x804C, 0x1B81 }, { 0x804D, 0x284C }, { 0x804E, 0x1F81 },
++	{ 0x804F, 0x284E }, { 0x8050, 0x3008 }, { 0x8051, 0x0081 }, { 0x8052, 0x3008 },
++	{ 0x8053, 0x00A8 }, { 0x8054, 0x3000 }, { 0x8055, 0x1BA6 }, { 0x8056, 0x3080 },
++	{ 0x8057, 0x0081 }, { 0x8058, 0x3840 }, { 0x8059, 0x0081 }, { 0x805A, 0x0DA6 },
++	{ 0x805B, 0x3200 }, { 0x805C, 0x3200 }, { 0x805D, 0x3200 }, { 0x805E, 0x3200 },
++	{ 0x805F, 0x39BF }, { 0x8060, 0x0081 }, { 0x8061, 0x3200 }, { 0x8062, 0x3200 },
++	{ 0x8063, 0x3200 }, { 0x8064, 0x0BA8 }, { 0x8065, 0x2854 }, { 0x8066, 0x3008 },
++	{ 0x8067, 0x0081 }, { 0x8068, 0x0008 }, { 0x8069, 0x3048 }, { 0x806A, 0x0081 },
++	{ 0x806B, 0x1B81 }, { 0x806C, 0x286B }, { 0x806D, 0x1F81 }, { 0x806E, 0x286D },
++	{ 0x806F, 0x3008 }, { 0x8070, 0x0081 }, { 0x8071, 0x3008 }, { 0x8072, 0x00A8 },
++	{ 0x8073, 0x3048 }, { 0x8074, 0x0081 }, { 0x8075, 0x3200 }, { 0x8076, 0x3200 },
++	{ 0x8077, 0x3200 }, { 0x8078, 0x3200 }, { 0x8079, 0x3200 }, { 0x807A, 0x3200 },
++	{ 0x807B, 0x0DA7 }, { 0x807C, 0x1027 }, { 0x807D, 0x1B81 }, { 0x807E, 0x1427 },
++	{ 0x807F, 0x3008 }, { 0x8080, 0x0081 }, { 0x8081, 0x3200 }, { 0x8082, 0x3200 },
++	{ 0x8083, 0x3200 }, { 0x8084, 0x0BA8 }, { 0x8085, 0x2873 }, { 0x8086, 0x0827 },
++	{ 0x8087, 0x0008 },
++};
++
++#define PIC16F1_EXEC_WORDS 121
++
++#endif /* OPENOCD_TARGET_PIC16F1_EXEC_H */
+diff --git a/src/target/pic16f1_icsp.c b/src/target/pic16f1_icsp.c
+new file mode 100644
+index 0000000..3cca4e9
+--- /dev/null
++++ b/src/target/pic16f1_icsp.c
+@@ -0,0 +1,426 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++/*
++ * ICSP programming primitives for PIC16F1 devices with 6 bit commands.
++ * See pic16f1_icsp.h. The algorithms follow Gen6 in host/pk2probe.py.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <jtag/icsp.h>
++#include <helper/log.h>
++#include <helper/binarybuffer.h>
++#include "image.h"
++#include "pic16f1_icsp.h"
++
++/* 6 bit commands */
++#define CMD_LOAD_CONFIG   0x00
++#define CMD_LOAD_PROG     0x02
++#define CMD_LOAD_DATA     0x03
++#define CMD_READ_PROG     0x04
++#define CMD_READ_DATA     0x05
++#define CMD_INCREMENT     0x06
++#define CMD_RESET_ADDR    0x16
++#define CMD_BEGIN_INT     0x08
++#define CMD_ERASE_PROG    0x09
++#define CMD_ERASE_DATA    0x0B
++#define CMD_ERASE_ROW     0x11
++
++#define T_PROG_MS    3
++#define T_CONFIG_MS  6
++#define T_ERASE_MS   6
++
++/* Device IDs and memory sizes are from the Microchip device family packs;
++ * write latch counts are from the programming specifications (same table
++ * as host/pk2probe.py). */
++#define F193X(name, id, lid, words) \
++	{ "PIC16F" name, id, 0x3FE0, words, 8, 256, 2, 5500, true }, \
++	{ "PIC16LF" name, lid, 0x3FE0, words, 8, 256, 2, 3600, true }
++
++static const struct pic16f1_device devices[] = {
++	F193X("1933", 0x2300, 0x2400, 4096),
++	F193X("1934", 0x2340, 0x2440, 4096),
++	F193X("1936", 0x2360, 0x2460, 8192),
++	F193X("1937", 0x2380, 0x2480, 8192),
++	F193X("1938", 0x23A0, 0x24A0, 16384),
++	F193X("1939", 0x23C0, 0x24C0, 16384),
++	/* Listed in the reference tool, not tried with this driver */
++	{ "PIC16F1829", 0x27E0, 0x3FE0, 8192, 32, 256, 2, 5500, false },
++	{ "PIC16F1619", 0x307D, 0x3FFF, 8192, 32, 0, 3, 5500, false },
++};
++
++const struct pic16f1_device *pic16f1_identify(uint16_t dev_word)
++{
++	for (size_t i = 0; i < ARRAY_SIZE(devices); i++) {
++		if ((dev_word & devices[i].id_mask) == devices[i].dev_id)
++			return &devices[i];
++	}
++	return NULL;
++}
++
++void pic16f1_bytes_to_words(const uint8_t *bytes, unsigned int nwords, uint16_t *words)
++{
++	for (unsigned int i = 0; i < nwords; i++)
++		words[i] = (bytes[2 * i] | (bytes[2 * i + 1] << 8)) & PIC16F1_BLANK;
++}
++
++void pic16f1_words_to_bytes(const uint16_t *words, unsigned int nwords, uint8_t *bytes)
++{
++	for (unsigned int i = 0; i < nwords; i++) {
++		bytes[2 * i] = words[i] & 0xFF;
++		bytes[2 * i + 1] = words[i] >> 8;
++	}
++}
++
++static int g6_cmd(uint8_t cmd)
++{
++	const uint8_t op[] = { ICSP_OP_G6_CMD, cmd };
++	return icsp_queue(op, sizeof(op), 0);
++}
++
++static int g6_load(uint8_t cmd, uint16_t word)
++{
++	const uint8_t op[] = { ICSP_OP_G6_LOAD, cmd, word & 0xFF, word >> 8 };
++	return icsp_queue(op, sizeof(op), 0);
++}
++
++/* Leave the address counter at addr. It can only be reset to 0, loaded
++ * with 0x8000, or incremented. */
++static int seek(uint32_t addr)
++{
++	uint32_t n;
++
++	if (addr >= 0x8000) {
++		g6_load(CMD_LOAD_CONFIG, 0x3FFF);
++		n = addr - 0x8000;
++	} else {
++		g6_cmd(CMD_RESET_ADDR);
++		n = addr;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		int retval = g6_cmd(CMD_INCREMENT);
++		if (retval != ERROR_OK)
++			return retval;
++		/* keep the queue bounded */
++		if ((i & 0x3FFF) == 0x3FFF && icsp_flush(NULL, 0) != ERROR_OK)
++			return ERROR_FAIL;
++	}
++	return ERROR_OK;
++}
++
++int pic16f1_read_words(uint32_t addr, unsigned int count, uint16_t *words)
++{
++	uint8_t *buf = malloc(2 * count + 2);
++	if (!buf)
++		return ERROR_FAIL;
++
++	int retval = icsp_flush(NULL, 0);
++	if (retval == ERROR_OK)
++		retval = seek(addr);
++	if (retval == ERROR_OK)
++		retval = icsp_flush(NULL, 0);
++
++	unsigned int done = 0;
++	while (retval == ERROR_OK && done < count) {
++		/* a packet carries at most 62 bytes of reply: 31 words */
++		unsigned int n = MIN(count - done, 31U);
++		const uint8_t op[] = { ICSP_OP_G6_READN, CMD_READ_PROG, CMD_INCREMENT, n };
++		retval = icsp_queue(op, sizeof(op), 2 * n);
++		if (retval == ERROR_OK)
++			retval = icsp_flush(buf + 2 * done, 2 * (count - done));
++		done += n;
++	}
++	if (retval == ERROR_OK) {
++		for (unsigned int i = 0; i < count; i++)
++			words[i] = buf[2 * i] | (buf[2 * i + 1] << 8);
++	}
++	free(buf);
++	return retval;
++}
++
++int pic16f1_read_eeprom(unsigned int count, uint8_t *bytes)
++{
++	uint8_t *buf = malloc(2 * count + 2);
++	if (!buf)
++		return ERROR_FAIL;
++
++	int retval = icsp_flush(NULL, 0);
++	if (retval == ERROR_OK)
++		retval = g6_cmd(CMD_RESET_ADDR);
++	if (retval == ERROR_OK)
++		retval = icsp_flush(NULL, 0);
++	unsigned int done = 0;
++	while (retval == ERROR_OK && done < count) {
++		unsigned int n = MIN(count - done, 31U);
++		const uint8_t op[] = { ICSP_OP_G6_READN, CMD_READ_DATA, CMD_INCREMENT, n };
++		retval = icsp_queue(op, sizeof(op), 2 * n);
++		if (retval == ERROR_OK)
++			retval = icsp_flush(buf + 2 * done, 2 * (count - done));
++		done += n;
++	}
++	if (retval == ERROR_OK) {
++		for (unsigned int i = 0; i < count; i++)
++			bytes[i] = buf[2 * i];
++	}
++	free(buf);
++	return retval;
++}
++
++int pic16f1_connect(const struct pic16f1_device **dev, uint16_t *rev, uint16_t *dev_word)
++{
++	const struct icsp_config *c = icsp_get_config();
++	uint16_t ids[2];
++
++	int retval = icsp_enter_programming();
++	if (retval != ERROR_OK)
++		return retval;
++
++	retval = pic16f1_read_words(PIC16F1_REVID_ADDR, 2, ids);
++	if (retval != ERROR_OK) {
++		icsp_exit_programming(true);
++		return retval;
++	}
++
++	const struct pic16f1_device *d = pic16f1_identify(ids[1]);
++	if (!d) {
++		LOG_ERROR("pic16f1: no supported device answered (device ID word 0x%04x); "
++			"check wiring, power and the entry method (pk2icsp hvp on)", ids[1]);
++		icsp_exit_programming(true);
++		return ERROR_FAIL;
++	}
++	if (c->power && c->vdd_mv > d->vdd_max_mv) {
++		LOG_ERROR("pic16f1: %s allows at most %.1f V, VDD is set to %.1f V",
++			d->name, d->vdd_max_mv / 1000.0, c->vdd_mv / 1000.0);
++		icsp_exit_programming(false);
++		return ERROR_FAIL;
++	}
++	if (dev)
++		*dev = d;
++	if (rev)
++		*rev = ids[0];
++	if (dev_word)
++		*dev_word = ids[1];
++	return ERROR_OK;
++}
++
++int pic16f1_disconnect(void)
++{
++	return icsp_exit_programming(true);
++}
++
++int pic16f1_bulk_erase(const struct pic16f1_device *dev)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	/* With the address in configuration space the user IDs and the
++	 * configuration words go too. */
++	g6_load(CMD_LOAD_CONFIG, 0x3FFF);
++	g6_cmd(CMD_ERASE_PROG);
++	icsp_delay_ms(T_ERASE_MS);
++	if (dev && dev->eeprom) {
++		g6_cmd(CMD_ERASE_DATA);
++		icsp_delay_ms(T_ERASE_MS);
++	}
++	g6_cmd(CMD_RESET_ADDR);
++	return icsp_flush(NULL, 0);
++}
++
++int pic16f1_erase_eeprom(void)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	g6_load(CMD_LOAD_CONFIG, 0x3FFF);
++	g6_cmd(CMD_ERASE_DATA);
++	icsp_delay_ms(T_ERASE_MS);
++	g6_cmd(CMD_RESET_ADDR);
++	return icsp_flush(NULL, 0);
++}
++
++int pic16f1_row_erase(uint32_t addr)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	seek(addr);
++	g6_cmd(CMD_ERASE_ROW);
++	icsp_delay_ms(T_ERASE_MS);
++	return icsp_flush(NULL, 0);
++}
++
++int pic16f1_write_flash(const struct pic16f1_device *dev, uint32_t first,
++		const uint16_t *words, unsigned int count)
++{
++	unsigned int row = dev->latches;
++
++	if (first % row || count % row)
++		return ERROR_FAIL;
++
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	seek(first);
++	for (unsigned int base = 0; base < count; base += row) {
++		bool blank = true;
++		for (unsigned int i = 0; i < row; i++)
++			if (words[base + i] != PIC16F1_BLANK)
++				blank = false;
++		if (blank) {
++			for (unsigned int i = 0; i < row; i++)
++				g6_cmd(CMD_INCREMENT);
++		} else {
++			for (unsigned int i = 0; i < row; i += 29) {
++				unsigned int n = MIN(row - i, 29U);
++				uint8_t op[4 + 2 * 29];
++				op[0] = ICSP_OP_G6_LOADN;
++				op[1] = CMD_LOAD_PROG;
++				op[2] = CMD_INCREMENT;
++				op[3] = n;
++				for (unsigned int k = 0; k < n; k++) {
++					op[4 + 2 * k] = words[base + i + k] & 0xFF;
++					op[5 + 2 * k] = words[base + i + k] >> 8;
++				}
++				icsp_queue(op, 4 + 2 * n, 0);
++				if (i + 29 < row)
++					g6_cmd(CMD_INCREMENT);
++			}
++			g6_cmd(CMD_BEGIN_INT);
++			icsp_delay_ms(T_PROG_MS);
++			g6_cmd(CMD_INCREMENT);
++		}
++	}
++	return icsp_flush(NULL, 0);
++}
++
++int pic16f1_write_config_words(uint32_t addr, const uint16_t *words, unsigned int count)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	g6_load(CMD_LOAD_CONFIG, 0x3FFF);
++	uint32_t cur = 0x8000;
++	for (unsigned int i = 0; i < count; i++) {
++		while (cur < addr + i) {
++			g6_cmd(CMD_INCREMENT);
++			cur++;
++		}
++		g6_load(CMD_LOAD_PROG, words[i]);
++		g6_cmd(CMD_BEGIN_INT);
++		icsp_delay_ms(T_CONFIG_MS);
++	}
++	return icsp_flush(NULL, 0);
++}
++
++int pic16f1_write_eeprom(unsigned int first, const uint8_t *bytes, unsigned int count)
++{
++	int retval = icsp_flush(NULL, 0);
++	if (retval != ERROR_OK)
++		return retval;
++	g6_cmd(CMD_RESET_ADDR);
++	for (unsigned int i = 0; i < first; i++)
++		g6_cmd(CMD_INCREMENT);
++	for (unsigned int i = 0; i < count; i++) {
++		if (bytes[i] != 0xFF) {
++			g6_load(CMD_LOAD_DATA, bytes[i]);
++			g6_cmd(CMD_BEGIN_INT);
++			icsp_delay_ms(T_CONFIG_MS);
++		}
++		g6_cmd(CMD_INCREMENT);
++	}
++	return icsp_flush(NULL, 0);
++}
++
++/* ---- HEX images ------------------------------------------------------------ */
++
++void pic16f1_image_free(struct pic16f1_image *img)
++{
++	free(img->flash);
++	img->flash = NULL;
++}
++
++int pic16f1_image_split(struct image *image, const struct pic16f1_device *dev,
++		struct pic16f1_image *out)
++{
++	size_t flash_bytes = (size_t)dev->flash_words * 2;
++	uint8_t *fb = malloc(flash_bytes);
++	uint8_t cb[2 * PIC16F1_CONFIG_SPACE_WORDS];
++	uint8_t eb[2 * PIC16F1_MAX_EEPROM];
++	bool cp[2 * PIC16F1_CONFIG_SPACE_WORDS] = { false };
++	bool ep[2 * PIC16F1_MAX_EEPROM] = { false };
++	bool *fp = calloc(flash_bytes, 1);
++	int retval = ERROR_OK;
++
++	memset(out, 0, sizeof(*out));
++	memset(cb, 0xFF, sizeof(cb));
++	memset(eb, 0xFF, sizeof(eb));
++	out->flash = malloc(dev->flash_words * sizeof(uint16_t));
++	if (!fb || !fp || !out->flash) {
++		retval = ERROR_FAIL;
++		goto done;
++	}
++	memset(fb, 0xFF, flash_bytes);
++
++	for (unsigned int s = 0; s < image->num_sections; s++) {
++		uint32_t base = image->sections[s].base_address;
++		uint32_t size = image->sections[s].size;
++		uint8_t *data = malloc(size ? size : 1);
++		size_t got = 0;
++
++		if (!data) {
++			retval = ERROR_FAIL;
++			goto done;
++		}
++		if (image_read_section(image, s, 0, size, data, &got) != ERROR_OK || got != size) {
++			free(data);
++			retval = ERROR_FAIL;
++			goto done;
++		}
++		for (uint32_t i = 0; i < size; i++) {
++			uint32_t a = base + i;
++			if (a < flash_bytes) {
++				fb[a] = data[i];
++				fp[a] = true;
++			} else if (a < PIC16F1_BASE_CONFIG) {
++				LOG_ERROR("pic16f1: HEX data at byte address 0x%05" PRIx32
++					" is beyond the %" PRIu32 " word flash", a, dev->flash_words);
++				free(data);
++				retval = ERROR_FAIL;
++				goto done;
++			} else if (a < PIC16F1_BASE_CONFIG + sizeof(cb)) {
++				cb[a - PIC16F1_BASE_CONFIG] = data[i];
++				cp[a - PIC16F1_BASE_CONFIG] = true;
++			} else if (a >= PIC16F1_BASE_EEPROM && a < PIC16F1_BASE_EEPROM + 2 * dev->eeprom) {
++				ep[a - PIC16F1_BASE_EEPROM] = true;
++				eb[a - PIC16F1_BASE_EEPROM] = data[i];
++			} else {
++				LOG_DEBUG("pic16f1: ignoring HEX data at byte address 0x%05" PRIx32, a);
++			}
++		}
++		free(data);
++	}
++
++	pic16f1_bytes_to_words(fb, dev->flash_words, out->flash);
++	/* a word with only its low byte present has the high byte blank */
++	pic16f1_bytes_to_words(cb, PIC16F1_CONFIG_SPACE_WORDS, out->cfg);
++	for (unsigned int i = 0; i < PIC16F1_CONFIG_SPACE_WORDS; i++) {
++		out->cfg_present[i] = cp[2 * i] || cp[2 * i + 1];
++		/* Only words the part implements as user IDs or configuration
++		 * words are ever written (see flash driver). */
++	}
++	for (unsigned int i = 0; i < dev->eeprom; i++) {
++		if (ep[2 * i]) {
++			out->ee[i] = eb[2 * i];
++			out->has_ee = true;
++		}
++	}
++	retval = ERROR_OK;
++done:
++	free(fb);
++	free(fp);
++	if (retval != ERROR_OK)
++		pic16f1_image_free(out);
++	return retval;
++}
+diff --git a/src/target/pic16f1_icsp.h b/src/target/pic16f1_icsp.h
+new file mode 100644
+index 0000000..24d6a79
+--- /dev/null
++++ b/src/target/pic16f1_icsp.h
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++/*
++ * ICSP programming primitives for PIC16F1 devices with 6 bit commands
++ * (PIC16F1xxx, e.g. PIC16(L)F193x), shared by the pic16f1 flash driver and
++ * the pic16f1 target (debug load).  They run on top of the icsp transport
++ * (jtag/icsp.h) and are modelled on Gen6 in host/pk2probe.py of the probe
++ * project.
++ *
++ * Addresses are word addresses in the device's program space: 0 to
++ * flash_words - 1 is user program memory, 0x8000 and up is configuration
++ * space (0x8000-0x8003 user IDs, 0x8004 debug vector, 0x8005 revision,
++ * 0x8006 device ID, 0x8007-0x8008 configuration words, 0x8009-0x800A
++ * calibration, 0x8010-0x80FF debug executive when DEBUG is enabled).
++ */
++
++#ifndef OPENOCD_TARGET_PIC16F1_ICSP_H
++#define OPENOCD_TARGET_PIC16F1_ICSP_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++struct image;
++
++#define PIC16F1_BLANK          0x3FFF
++#define PIC16F1_USERID_ADDR    0x8000
++#define PIC16F1_USERID_WORDS   4
++#define PIC16F1_REVID_ADDR     0x8005
++#define PIC16F1_DEVID_ADDR     0x8006
++#define PIC16F1_CONFIG_ADDR    0x8007
++#define PIC16F1_CONFIG_SPACE_WORDS 16   /* 0x8000-0x800F is what the flash bank covers */
++#define PIC16F1_EEPROM_HEX     0xF000   /* HEX word address of data EEPROM */
++#define PIC16F1_MAX_EEPROM     256
++
++/* Image (HEX file) byte address of the three regions (word address * 2) */
++#define PIC16F1_BASE_FLASH     0x00000
++#define PIC16F1_BASE_CONFIG    0x10000
++#define PIC16F1_BASE_EEPROM    0x1E000
++
++/* PIC16(L)F193x: DEBUG is bit 12 of configuration word 2; 0 = enabled */
++#define PIC16F1_CONFIG2_ADDR   0x8008
++#define PIC16F1_CONFIG2_DEBUG  0x1000
++
++struct pic16f1_device {
++	const char *name;
++	uint16_t dev_id;           /* device ID, with the revision bits masked out */
++	uint16_t id_mask;
++	uint32_t flash_words;
++	unsigned int latches;      /* words per program memory write */
++	unsigned int eeprom;       /* bytes of data EEPROM */
++	unsigned int config_words; /* number of configuration words from 0x8007 */
++	unsigned int vdd_max_mv;
++	bool debug;                /* has the on-chip debug executive support */
++};
++
++const struct pic16f1_device *pic16f1_identify(uint16_t dev_word);
++
++/**
++ * Enter programming mode (as configured for the adapter), read the device
++ * ID and identify the device. Stays in programming mode on success.
++ * @param expect if not NULL, the device found must be this one.
++ */
++int pic16f1_connect(const struct pic16f1_device **dev, uint16_t *rev, uint16_t *dev_word);
++
++/** Leave programming mode; the target leaves reset and keeps its power. */
++int pic16f1_disconnect(void);
++
++int pic16f1_read_words(uint32_t addr, unsigned int count, uint16_t *words);
++int pic16f1_read_eeprom(unsigned int count, uint8_t *bytes);
++
++/** Bulk erase: program memory, user IDs, configuration words, EEPROM. */
++int pic16f1_bulk_erase(const struct pic16f1_device *dev);
++
++/** Erase the data EEPROM only. */
++int pic16f1_erase_eeprom(void);
++
++/** Row erase (32 words) of the row containing addr, in debug space. */
++int pic16f1_row_erase(uint32_t addr);
++
++/**
++ * Write program memory words starting at word address first (a multiple of
++ * the write latch size; count too). Blank latches are skipped.
++ */
++int pic16f1_write_flash(const struct pic16f1_device *dev, uint32_t first,
++		const uint16_t *words, unsigned int count);
++
++/** Write single words in configuration space, one at a time. */
++int pic16f1_write_config_words(uint32_t addr, const uint16_t *words, unsigned int count);
++
++/** Write data EEPROM bytes from address first (0xFF bytes are skipped). */
++int pic16f1_write_eeprom(unsigned int first, const uint8_t *bytes, unsigned int count);
++
++/** An HEX image split into the device's regions. */
++struct pic16f1_image {
++	uint16_t *flash;               /* flash_words entries, BLANK where absent */
++	uint16_t cfg[PIC16F1_CONFIG_SPACE_WORDS];   /* words 0x8000-0x800F */
++	bool cfg_present[PIC16F1_CONFIG_SPACE_WORDS];
++	uint8_t ee[PIC16F1_MAX_EEPROM];
++	bool has_ee;
++};
++
++int pic16f1_image_split(struct image *image, const struct pic16f1_device *dev,
++		struct pic16f1_image *out);
++void pic16f1_image_free(struct pic16f1_image *img);
++
++/** Convert HEX bytes (little endian words) to 14 bit words. */
++void pic16f1_bytes_to_words(const uint8_t *bytes, unsigned int nwords, uint16_t *words);
++void pic16f1_words_to_bytes(const uint16_t *words, unsigned int nwords, uint8_t *bytes);
++
++struct target;
++
++/**
++ * Programming mode resets the target: forget its state (debug session,
++ * register cache) so that the next poll finds out. No-op for other targets.
++ */
++void pic16f1_target_link_lost(struct target *target);
++
++#endif /* OPENOCD_TARGET_PIC16F1_ICSP_H */
+diff --git a/src/target/target.c b/src/target/target.c
+index e3a6f95..5a2f319 100644
+--- a/src/target/target.c
++++ b/src/target/target.c
+@@ -102,6 +102,7 @@ extern struct target_type or1k_target;
+ extern struct target_type quark_x10xx_target;
+ extern struct target_type quark_d20xx_target;
+ extern struct target_type stm8_target;
++extern struct target_type pic16f1_target;
+ extern struct target_type riscv_target;
+ extern struct target_type mem_ap_target;
+ extern struct target_type esirisc_target;
+@@ -142,6 +143,7 @@ static struct target_type *target_types[] = {
+ 	&quark_x10xx_target,
+ 	&quark_d20xx_target,
+ 	&stm8_target,
++	&pic16f1_target,
+ 	&riscv_target,
+ 	&mem_ap_target,
+ 	&esirisc_target,
+diff --git a/src/transport/transport.h b/src/transport/transport.h
+index 00d8b07..7416a2c 100644
+--- a/src/transport/transport.h
++++ b/src/transport/transport.h
+@@ -86,6 +86,7 @@ bool transport_is_swd(void);
+ bool transport_is_dapdirect_jtag(void);
+ bool transport_is_dapdirect_swd(void);
+ bool transport_is_swim(void);
++bool transport_is_icsp(void);
+ 
+ #if BUILD_HLADAPTER
+ bool transport_is_hla(void);
+diff --git a/tcl/interface/pk2icsp.cfg b/tcl/interface/pk2icsp.cfg
+new file mode 100644
+index 0000000..bfd3e08
+--- /dev/null
++++ b/tcl/interface/pk2icsp.cfg
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++#
++# PICkit 2 running the ICSP probe firmware (USB 04D8:0033, vendor interface),
++# for PIC16F1 targets. Only the icsp transport is available.
++#
++# Settings, to be changed in a board script or before "init":
++#   pk2icsp vdd 3000        target VDD in mV (default 3000, at most 5000;
++#                           mind the maximum of the target: 3600 for PIC16LF)
++#   pk2icsp power on|off    off: the target has its own supply
++#   pk2icsp hvp on|off      high voltage entry of programming mode (default
++#                           off, the low voltage key; the target needs LVP
++#                           enabled and MCLR assigned for it)
++#   pk2icsp vpp 8500        VPP in mV for high voltage entry
++#   pk2icsp power_off_on_quit on|off   switch the target off when OpenOCD exits
++#
++
++adapter driver pk2icsp
++
++# the speed is fixed by the probe
++adapter speed 100
+diff --git a/tcl/target/pic16f193x.cfg b/tcl/target/pic16f193x.cfg
+new file mode 100644
+index 0000000..4f18859
+--- /dev/null
++++ b/tcl/target/pic16f193x.cfg
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++#
++# Microchip PIC16(L)F193x (PIC16F1933/34/36/37/38/39 and the LF versions)
++# with the on-chip debug executive, through the PICkit 2 ICSP probe.
++#
++# Address convention: code addresses are byte addresses as in HEX files
++# (2 * word address), program flash at 0; data memory is at 0x800000 + the
++# data address (register file 0x000-0xFFF, linear 0x2000 and up).
++#
++# Variables: CHIPNAME. The flash banks are sized by the probe.
++#
++
++transport select icsp
++
++if { [info exists CHIPNAME] } {
++   set _CHIPNAME $CHIPNAME
++} else {
++   set _CHIPNAME pic16f193x
++}
++
++icsp newtap $_CHIPNAME cpu
++
++set _TARGETNAME $_CHIPNAME.cpu
++target create $_TARGETNAME pic16f1 -chain-position $_CHIPNAME.cpu
++
++# One bank per memory, selected by the base (HEX file byte address). Erasing
++# the program flash bank is a bulk erase of the whole device.
++flash bank $_CHIPNAME.flash  pic16f1 0x00000 0 0 0 $_TARGETNAME
++flash bank $_CHIPNAME.config pic16f1 0x10000 0 0 0 $_TARGETNAME
++flash bank $_CHIPNAME.eeprom pic16f1 0x1E000 0 0 0 $_TARGETNAME
++
++# Only one hardware breakpoint exists, which halts after the instruction.
++# Make gdb's software breakpoint requests use it.
++gdb_breakpoint_override hard
++
++# There is no srst; reset is done by the target driver
++reset_config none
