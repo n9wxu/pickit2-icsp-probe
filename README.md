@@ -8,7 +8,7 @@ and OpenOCD support. It is the probe for the
 | | |
 |---|---|
 | Programming | Low-voltage (key sequence) and high-voltage (VPP on MCLR) entry. Flash, EEPROM, user IDs, configuration words |
-| Debugging | Halt, single step, run, reset, one hardware breakpoint, registers and data memory, using a debug executive written for this project |
+| Debugging | Halt, single step, run, reset, software breakpoints, one hardware breakpoint, registers and data memory, using a debug executive written for this project |
 | Target power | 1.8–5.0 V from the probe, or self-powered targets |
 | Host | USB vendor interface, Python tools, OpenOCD driver |
 
@@ -34,6 +34,7 @@ Debugging supports the PIC16(L)F193x only.
 | `host/pk2probe.py` | Probe library and programming tool |
 | `host/pk2debug.py`, `host/icd16f1.py` | Debugger and the debug executive |
 | `host/asm14.py` | Small PIC16F1 assembler used to build the executive |
+| `host/emu16f1.py` | Carries out one instruction on a halted target, for software breakpoints |
 | `openocd/` | OpenOCD patch, build instructions |
 | `docs/protocol.md` | Probe USB protocol |
 | `docs/icd.md` | How on-chip debug works on the PIC16(L)F193x |
@@ -119,15 +120,23 @@ the format the stock firmware uses.
 ```sh
 .venv/bin/python host/pk2debug.py --vdd 3300 load test/blink/blink.hex
 .venv/bin/python host/pk2debug.py step 3
+.venv/bin/python host/pk2debug.py break 7f8          # software breakpoint at word 0x7F8
+.venv/bin/python host/pk2debug.py cont --wait 5
+.venv/bin/python host/pk2debug.py clear 7f8
 .venv/bin/python host/pk2debug.py cont
 .venv/bin/python host/pk2debug.py halt
 .venv/bin/python host/pk2debug.py read 70 16
 .venv/bin/python host/pk2debug.py unload
 ```
 
-The limits are in [docs/icd.md](docs/icd.md). The main ones: a breakpoint
-stops after its instruction, there is one breakpoint, and the program counter
-of a halted target cannot be changed.
+Software breakpoints stop before their instruction and there can be many.
+Each one rewrites a row of the target's flash when it is set and when it is
+removed, which takes a few seconds and wears the flash, so they suit places
+you stop at repeatedly. `cont ADDR` uses the one hardware breakpoint
+instead, which costs nothing but stops after the instruction at `ADDR` has
+executed. The program counter of a halted target cannot be set.
+[docs/icd.md](docs/icd.md) explains how the breakpoints work and lists the
+limits.
 
 A part programmed for debugging does not run without a debugger. `unload`
 erases it, including the executive, which an ordinary bulk erase leaves in

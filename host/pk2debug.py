@@ -5,6 +5,8 @@
     pk2debug.py regs                 core registers
     pk2debug.py step [N]             execute N instructions (default 1)
     pk2debug.py cont [ADDR]          run; with ADDR, until that instruction has executed
+    pk2debug.py break [ADDR]         set a software breakpoint; without ADDR, list them
+    pk2debug.py clear ADDR           remove a software breakpoint
     pk2debug.py halt                 stop a running target
     pk2debug.py reset                reset and stop at the reset vector
     pk2debug.py read ADDR [N]        data memory (register file address, or 0x2000+ linear)
@@ -14,10 +16,14 @@
 The probe keeps the target powered between commands, so each command simply
 continues the session.  Addresses and values are hexadecimal.
 
-A breakpoint stops the target after the instruction at ADDR has executed, and
-there is one hardware breakpoint.  The program counter cannot be changed.
+"cont ADDR" uses the one hardware breakpoint, which stops the target after
+the instruction at ADDR has executed.  Software breakpoints stop before
+their instruction and there can be any number; each one rewrites a row of
+flash when it is set or removed.  They are remembered between commands in
+~/.pk2debug/session.json.  The program counter cannot be changed.
 """
 import argparse
+import os
 import sys
 
 from pk2probe import Probe, ProbeError, load_hex
@@ -48,6 +54,8 @@ def main():
     s = sub.add_parser('step'); s.add_argument('count', nargs='?', type=int, default=1)
     s = sub.add_parser('cont'); s.add_argument('addr', nargs='?', type=hexint)
     s.add_argument('--wait', type=float, default=0, metavar='S', help='wait up to S seconds for the target to stop')
+    s = sub.add_parser('break'); s.add_argument('addr', nargs='?', type=hexint)
+    s = sub.add_parser('clear'); s.add_argument('addr', type=hexint)
     sub.add_parser('halt')
     sub.add_parser('reset')
     s = sub.add_parser('read'); s.add_argument('addr', type=hexint); s.add_argument('count', nargs='?', type=int, default=1)
@@ -59,7 +67,8 @@ def main():
         p = Probe()
     except ProbeError as e:
         sys.exit(f'error: {e}')
-    d = Debugger(p, vdd_mv=args.vdd, power=not args.no_power)
+    d = Debugger(p, vdd_mv=args.vdd, power=not args.no_power,
+                 state_path=os.path.expanduser('~/.pk2debug/session.json'))
     try:
         if args.cmd == 'load':
             d.load(load_hex(args.file))
@@ -80,6 +89,14 @@ def main():
                 show_regs(d)
             else:
                 print('running')
+        elif args.cmd == 'break':
+            if args.addr is not None:
+                need_halted(d)
+                d.set_soft_breakpoint(args.addr)
+            print('software breakpoints: %s' % (' '.join('%04X' % a for a in sorted(d.breaks)) or 'none'))
+        elif args.cmd == 'clear':
+            need_halted(d)
+            d.clear_soft_breakpoint(args.addr)
         elif args.cmd == 'halt':
             d.halt()
             show_regs(d)

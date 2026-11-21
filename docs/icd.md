@@ -58,8 +58,10 @@ The core jumps to the debug vector in three cases.
 | Opcode 0x0002 or 0x0003 | After that instruction. These are software breakpoints |
 | ICSPCLK driven high while user code runs | Within a few instructions. ICSPDAT alone has no effect |
 
-In all cases the reported PC is the next instruction to execute. A breakpoint
-therefore stops *after* its instruction, not before it.
+In all cases the reported PC is the next instruction to execute. A hardware
+breakpoint therefore stops *after* its instruction, not before it. The
+debuggers build software breakpoints that stop before it; see "Software
+breakpoints" below.
 
 A power-on reset enables the hardware breakpoint at address 0, so a freshly
 powered target stops with PC = 1, having executed the instruction at the
@@ -88,8 +90,9 @@ Returning with the bit still set makes the breakpoint match the current
 instruction, so exactly one instruction runs. That is the single step.
 
 Writing 0xF91:0xF90 sets the breakpoint only. It does not change where
-execution resumes, and no way of changing the PC of a halted target was
-found.
+execution resumes. Nothing in debug mode moves the PC of a halted target.
+A `RETURN` that the target executes in user mode after the resume does
+(D14); see "Software breakpoints".
 
 No other debug register exists in the data space. Every address that the
 production register map leaves undocumented reads zero in debug mode and
@@ -109,7 +112,7 @@ space usefully.
 ## The debug executive
 
 `host/icd16f1.py` builds the executive with the small assembler in
-`host/asm14.py`. It is 120 words.
+`host/asm14.py`. It is 133 words.
 
 On entry it selects bank 6, stores `W`, reads `STATUS` with `SWAPF` (which
 changes no flags) and stores the FSRs, all in 0x320–0x325. It then points
@@ -122,6 +125,7 @@ data low, and the target then clocks eight bits.
 | Read | 0x01, address low, address high | The byte read through `FSR0` |
 | Write | 0x02, address low, address high, value | None |
 | Resume | 0x03 | None. Registers are restored and opcode 0x0004 runs |
+| Unlock | 0x04 | None. Writes 0x55, 0xAA to `EECON2` and sets `WR`, which starts the flash operation the host set up in `EEADR`, `EEDAT` and `EECON1` (D15) |
 
 The host does the rest by reading and writing memory.
 
@@ -135,19 +139,69 @@ The host does the rest by reading and writing memory.
 | Halt | Drives ICSPCLK high for 200 µs, then releases it |
 | Reset | Sets the breakpoint to address 0, resumes, pulses MCLR |
 
+## Software breakpoints
+
+Both debuggers have them: any number, stopping before the instruction.
+
+When a program is loaded for debugging, a two-word gadget goes into flash
+that the image leaves blank, at the same offset of every page (the highest
+offset that is free in all of them, 0x7FE for a small program):
+
+| Address | Word | |
+|---|---|---|
+| G | 0x0002 | Break. The executive gets control with PC = G + 1 |
+| G + 1 | `RETURN` | Runs in user mode after the resume |
+
+It is in every page so that a `CALL` reaches a copy whatever `PCLATH` holds.
+
+| Step | What happens |
+|---|---|
+| Set a breakpoint at A | The executive erases the flash row holding A and writes it back with `CALL G` at A (the unlock command) |
+| The program reaches A | `CALL G` pushes A + 1; the break stops the target at G + 1 |
+| The debugger reports | PC = A, and the return stack without the entry the `CALL` pushed. Nothing of the instruction at A has happened |
+| Continue or step | The debugger pops that entry, does the work of the original instruction itself by reading and writing the user's registers and memory (`host/emu16f1.py`), pushes the address of the instruction that follows in execution, and resumes. The gadget's `RETURN` goes there |
+| Remove the breakpoint | The row is rewritten with the original instruction |
+
+A jump is therefore just a different address pushed; a `CALL` pushes its
+return address as well, a `RETURN` pushes what it popped.
+
+What to know when using them:
+
+- The gadget takes two words in each page. If the image leaves no offset
+  free in every page there are no software breakpoints. Blank flash that
+  the program writes at run time could collide with it.
+- A breakpoint uses one level of the return stack while the target is
+  stopped at it or on the way in. Reached with all 16 levels in use, it
+  overflows the stack.
+- `RESET`, `SLEEP` and `CLRWDT` cannot be carried out by memory access. A
+  software breakpoint on one of them is refused.
+- Setting or removing a breakpoint erases a flash row, which the part
+  survives a limited number of times (10,000 in the data sheet). The
+  OpenOCD target writes flash only when the target is about to run, and one
+  rewrite covers every change in a row, because debuggers remove and
+  re-insert breakpoints around each step.
+- A row rewrite takes about 4 s at the 500 kHz reset clock, most of it the
+  executive link.
+- The original instructions are held by the debugger, not the target. If
+  the debugger goes away with breakpoints set, the program in flash still
+  calls the gadget; load it again.
+- A runaway program that reaches the gadget stops there like at a break.
+- Program memory with write protection (`WRT`) cannot take breakpoints.
+- Peripherals are not stopped while the target is halted (seen with
+  Timer0 in D16), so time passes for them at a breakpoint as at any halt.
+
 ## Limits
 
-- One hardware breakpoint, which the single step also uses.
-- Breakpoints stop one instruction late.
-- The PC cannot be changed. After a software breakpoint the PC is already
-  past it, so the instruction it replaced cannot be re-run from flash. It
-  would have to be carried out some other way; see "Software breakpoints"
-  below. The debugger does not implement them.
+- One hardware breakpoint, which the single step also uses. It stops one
+  instruction late.
+- The PC cannot be set directly. Software breakpoints get round that for
+  their own purpose only.
 - The single-step bit in 0xF8E is not used yet. Stepping still borrows the
   hardware breakpoint.
-- Program memory can be read from a halted target but not written (D13).
-  The Python debugger still answers from the image it programmed; the
-  OpenOCD target reads the part.
+- Program memory can be read from a halted target (D13) and written a row
+  at a time (D15). The debuggers use the write for breakpoints only. The
+  Python debugger answers program memory reads from the image it
+  programmed; the OpenOCD target reads the part.
 - The executive needs about 2.5 ms per byte at the 500 kHz reset clock, so a
   register read takes about 10 ms.
 - `DEBUG` enabled means ICSPCLK and ICSPDAT belong to the debugger.
@@ -689,6 +743,9 @@ not move `STKPTR`. The experimental command was removed again.
 
 ### Software breakpoints: where this leaves them
 
+(Superseded by Phase 9, which found the missing mechanism in user flash.
+Software breakpoints are implemented.)
+
 On this part, by experiment:
 
 - the break instruction exists (0x0002, 0x0003);
@@ -775,6 +832,124 @@ The same registers are how a program writes its own flash. That needs the
 done with separate write commands; it would take a routine in the
 executive. Not tried.
 
+## Phase 9: software breakpoints after all
+
+On 2026-11-20 the owner of the board proposed handling a software
+breakpoint by doing the work of the replaced instruction in the executive,
+as if it had run, and continuing with real instructions. Phase 7 had left
+two gaps in that: instructions that change the PC, and writing flash in a
+session. Both were closed by experiment, and the work of the instruction
+was put in the host rather than the executive: the executive's read and
+write commands are enough for it, and 240 words would not hold an
+interpreter.
+
+### D14. Moving the PC with a RETURN in user flash
+
+`d14.py`, output in `d14.out`. D11 showed that a `RETURN` in the debug
+space ignores the user's stack. A `RETURN` executed in user mode cannot.
+The test image has a two-word gadget at offset 0x7F0 of every page:
+
+| Address | Word | |
+|---|---|---|
+| G | 0x0002 | Break. The executive gets control with PC = G + 1 |
+| G + 1 | `RETURN` | Runs in user mode after the resume |
+
+A breakpoint site holds `CALL G`. The gadget is in every page so that the
+`CALL` reaches a copy whatever `PCLATH` holds. At the halt `TOS` is the
+site address + 1. The host edits the stack and resumes.
+
+| Stands for | Stack edit | Result |
+|---|---|---|
+| An instruction without a jump | None | Continued at site + 1 |
+| A skip that is taken | `TOS` = site + 2 | Continued at site + 2; site + 1 did not run |
+| `GOTO t` | `TOS` = t | Continued at t |
+| `CALL t` | Push t | The subroutine ran and returned to site + 1 |
+| `RETURN` | Pop | Returned to the caller of the function holding the site |
+| Site in page 1, `PCLATH` = 0x08 | `TOS` = an address in page 0 | Halted in the page 1 copy (PC 0x0FF1), continued in page 0 |
+
+Every halt reported the expected PC and `TOS`, every counter moved as
+predicted, and `STKPTR` was back at its value from before the site each
+time. A single step from G + 1 stopped with the PC on the target and
+nothing at the target executed: a stop *before* an instruction, which the
+hardware breakpoint cannot give.
+
+Conclusion: the PC of a halted target can be set to any address, provided
+the halt is at the gadget. The cost is one level of the user's return
+stack while the target is stopped at a site.
+
+### D15. Writing flash from the executive
+
+`d15.py`, output in `d15.out`. The executive got a fourth command that
+runs the unlock sequence and sets `WR`. The host sets the address, data and
+`EECON1` with ordinary writes, one unlock per word: `LWLO` set for the first
+seven words of a set of eight latches, clear for the eighth, `FREE` for a
+row erase.
+
+| Step | Result |
+|---|---|
+| Write 8 words into a blank row | Read back as written; the rest of the row still blank |
+| Erase the row | Blank |
+| Erase row 0x20 of the running program and rewrite it with one instruction changed (`INCF 0x71` to `INCF 0x72`) | Read back as written, 2.0 s at the 500 kHz clock. On resuming, the counter at 0x72 ran and the one at 0x71 stopped |
+| Put the row back | Original behaviour |
+
+Conclusion: flash can be changed during a session without resetting the
+target. A row is 32 words; changing one word costs one erase cycle of its
+row.
+
+### D16. Emulation against the silicon
+
+`d16.py`, output in `d16.out`. Doing the work of an instruction by memory
+access only counts if the result is what the part would have produced. A
+test program holds 104 instructions covering every opcode group, with the
+operand kinds that have special rules: banked and common RAM, both `INDF`s
+(register file, linear and program memory addresses), `STATUS`, `WREG`,
+`PCL`, `BSR` and an FSR as operands, taken and untaken skips, forward and
+backward branches, `CALL`, `CALLW`, `RETURN`, `RETLW` and `RETFIE`. For
+each one, with random register and memory contents: record the state,
+emulate, record the result, restore the state, single step the real
+instruction, and compare 19 registers and memory bytes and the next PC.
+
+The first run had 5 differences in 204 comparisons, all from two rules the
+emulation had wrong:
+
+| Rule found | Evidence |
+|---|---|
+| When `STATUS` is the destination of an instruction that sets a flag, C, DC and Z are not written from the result. Only the instruction's own flags change | `CLRF STATUS` with C set left C set; `RLF STATUS,F` changed C only |
+| `STATUS_SHAD` is at 0xFE4 and `WREG_SHAD` at 0xFE5, and `STATUS_SHAD` holds three bits | `RETFIE` restored `W` from 0xFE5 |
+
+After correcting them: 315 comparisons over three laps, 1 difference. That
+one was `OPTION`, where the emulated run showed `TMR0IF` set and the real
+one did not: the value written started Timer0, which kept counting while
+the host worked. Peripherals are not frozen in debug mode by default.
+
+### D17. Software breakpoints end to end
+
+`d17.py`, output in `d17.out`. A loop with a call, two skips, two `GOTO`s
+and a `RETURN`, with counters that show what ran.
+
+| Check | Result |
+|---|---|
+| One breakpoint on a plain instruction | Stopped with PC on it and its instruction not run; `STKPTR` shown as empty. A step ran just that instruction |
+| Seven breakpoints, one on each kind | Two laps stopped in program order, 20 stops; the counters were what the program produces alone |
+| Stepping from the breakpoint on the `CALL` | Entered the function with the right return address; two more steps returned |
+| A second debugger object with the same state file | Knew the breakpoints and the PC, and continued |
+| All breakpoints removed while stopped at one | PC unchanged, flash identical to the original image, and the program ran on and counted correctly |
+| A breakpoint on the gadget, or beyond the flash | Refused |
+
+Setting one breakpoint took 4.5 s.
+
+The OpenOCD target was given the same program: 21 stops in program order,
+correct counters, flash restored after the breakpoints were removed, and
+no unexpected stop in 14 rounds of reset, move the breakpoint, run. With
+the toolchain's LLDB on its example program: breakpoints by function and
+line reported as breakpoint hits at the right PC, `next` and `finish` with
+user breakpoints set, eight hits in a loop, and the program's final value
+(83) correct afterwards.
+
+One LLDB session out of about a dozen showed a first stop with memory as
+it was before the program started, then carried on correctly. It was not
+captured and did not happen again.
+
 ## Mistakes and corrections
 
 | What | Where | How it was caught |
@@ -791,18 +966,25 @@ executive. Not tried.
 | Reset pulsed MCLR before the executive had left debug mode | D8, OpenOCD port | The port fell back to a power cycle every time; a delay was added |
 | Only two windows of the register space examined | X2, X3 | Whole data space scanned in D9 and D10 |
 | Program memory assumed unreadable during a session | D1 onward | D13: the part's own flash read works from the executive |
+| "The PC cannot be moved" concluded from debug-mode attempts only | D5, D11, Phase 7 | D14: a `RETURN` in user flash, with the stack edited from the executive |
+| Emulation wrote flags into `STATUS` as a destination, and had two shadow registers swapped | First D16 run | D16 itself: comparison with the part |
 
 ## Open questions
 
 - What bit 6 of 0xF8E does. The header name suggests it freezes
   peripherals while halted. That was not tested with a running peripheral.
 - How Microchip's tools make software breakpoints work on any instruction,
-  which the owner of the board believes they do. See "Software breakpoints".
+  which the owner of the board believes they do. D14 and D15 give one way;
+  whether it is theirs is unknown.
+- What a `CALL` to the gadget does with the return stack full, and whether
+  an interrupt taken between the resume and the gadget's `RETURN` is as
+  harmless as it should be (it pushes G + 1 and comes back to the `RETURN`).
+  Neither was tried.
 - 0xF8D mirrors the pin latches. Whether it has another use is unknown.
 - How many levels the debug-mode call stack has. The executive uses one.
-- Whether the PC of a halted target can be changed by any means. Writing
-  the breakpoint register does not (D5), and neither does a `RETURN` through
-  the user's stack (D11).
+- Whether the PC of a halted target can be changed from debug mode alone.
+  Writing the breakpoint register does not (D5), and neither does a `RETURN`
+  in the debug space (D11). A `RETURN` in user flash does (D14).
 - Why `RETURN` in X4 recorded no entries.
 - Whether the executive's own program space offers something the data
   space does not. Only the behaviour of opcodes 0x0002–0x0007, 0x000C–0x000F,

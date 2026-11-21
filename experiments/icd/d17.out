@@ -1,0 +1,29 @@
+gadget at offset 7FE of each page
+1. one breakpoint, on a plain instruction
+   set in 4.5 s
+   stops with PC on the breakpoint                            ok PC=0021
+   its instruction has not run                                ok 
+   registers hide the gadget                                  ok STKPTR=1F
+   a step runs just that instruction                          ok PC=0022
+   a lap later it stops there again                           ok [1, 1, 1, 0, 1]
+2. breakpoints on a CALL, a RETURN, two skips and two GOTOs as well
+   two laps stop in program order                             ok 
+   the program counted as it would have alone                 ok [3, 2, 3, 0, 3]
+3. stepping from breakpoints
+   step from the first lands on the CALL breakpoint           ok PC=0022
+   step into the CALL                                         ok PC=0060 STKPTR=00
+   two more steps return from it                              ok PC=0023 STKPTR=1F
+4. a second debugger object picks the session up from the state file
+   stopped at the next breakpoint                             ok decfsz
+   it knows the breakpoints and the PC                        ok 
+   and can continue                                           ok goto
+5. remove them all while stopped at one, and run
+   PC still reads as the breakpoint                           ok PC=0028
+   flash is the original program again                        ok 
+   the target runs without stopping                           ok 
+   and counted correctly                                      ok [69, 35, 69, 0, 69] PC=0020
+   nothing left on the stack                                  ok STKPTR=1F
+6. things that must be refused
+   a breakpoint on the gadget                                 ok 
+   a breakpoint beyond the flash                              ok 
+all passed

@@ -1,0 +1,111 @@
+seed 473781597
+0020 SUBWF 0x20,F             same, next 0021
+0021 SUBWF 0x20,W             same, next 0022
+0022 DECF 0x20,F              same, next 0023
+0023 DECF 0x20,W              same, next 0024
+0024 IORWF 0x20,F             same, next 0025
+0025 IORWF 0x20,W             same, next 0026
+0026 ANDWF 0x20,F             same, next 0027
+0027 ANDWF 0x20,W             same, next 0028
+0028 XORWF 0x20,F             same, next 0029
+0029 XORWF 0x20,W             same, next 002A
+002A ADDWF 0x20,F             same, next 002B
+002B ADDWF 0x20,W             same, next 002C
+002C MOVF 0x20,F              same, next 002D
+002D MOVF 0x20,W              same, next 002E
+002E COMF 0x20,F              same, next 002F
+002F COMF 0x20,W              same, next 0030
+0030 INCF 0x20,F              same, next 0031
+0031 INCF 0x20,W              same, next 0032
+0032 RRF 0x20,F               same, next 0033
+0033 RRF 0x20,W               same, next 0034
+0034 RLF 0x20,F               same, next 0035
+0035 RLF 0x20,W               same, next 0036
+0036 SWAPF 0x20,F             same, next 0037
+0037 SWAPF 0x20,W             same, next 0038
+0038 LSLF 0x20,F              same, next 0039
+0039 LSLF 0x20,W              same, next 003A
+003A LSRF 0x20,F              same, next 003B
+003B LSRF 0x20,W              same, next 003C
+003C ASRF 0x20,F              same, next 003D
+003D ASRF 0x20,W              same, next 003E
+003E SUBWFB 0x20,F            same, next 003F
+003F SUBWFB 0x20,W            same, next 0040
+0040 ADDWFC 0x20,F            same, next 0041
+0041 ADDWFC 0x20,W            same, next 0042
+0042 SUBWF equal              same, next 0043
+0043 ADDWF carry              same, next 0044
+0044 INCF to zero             same, next 0045
+0045 CLRF 0x20                same, next 0046
+0046 CLRW                     same, next 0047
+0047 MOVWF 0x20               same, next 0048
+0048 MOVWF 0x70               same, next 0049
+0049 DECFSZ 0x20,F            same, next 004A
+004B DECFSZ skips             same, next 004D
+004D INCFSZ 0x20,W            same, next 004E
+004F INCFSZ skips             same, next 0051
+0051 BCF 0x20,3               same, next 0052
+0052 BSF 0x20,6               same, next 0053
+0053 BTFSC 0x20,5             same, next 0054
+0055 BTFSS 0x20,5             same, next 0056
+0057 BTFSC 0x20,0             same, next 0059
+0059 BTFSS 0x20,7             same, next 005B
+005B ADDLW 0x5C               same, next 005C
+005C ANDLW 0x5C               same, next 005D
+005D IORLW 0x5C               same, next 005E
+005E MOVLW 0x5C               same, next 005F
+005F SUBLW 0x5C               same, next 0060
+0060 XORLW 0x5C               same, next 0061
+0061 MOVLB 1                  same, next 0062
+0062 INCF 0x20,F in bank 1    same, next 0063
+0063 MOVLP 0x15               same, next 0064
+0064 ADDWF INDF0,F            same, next 0065
+0065 MOVF INDF1,W (linear)    same, next 0066
+0066 MOVF INDF0,W (flash)     same, next 0067
+0067 MOVIW ++FSR0             same, next 0068
+0068 MOVIW --FSR0             same, next 0069
+0069 MOVIW FSR1++             same, next 006A
+006A MOVIW FSR1--             same, next 006B
+006B MOVWI ++FSR1             same, next 006C
+006C MOVWI --FSR1             same, next 006D
+006D MOVWI FSR0++             same, next 006E
+006E MOVWI FSR0--             same, next 006F
+006F MOVIW 2[FSR0]            same, next 0070
+0070 MOVIW -1[FSR1]           same, next 0071
+0071 MOVWI 1[FSR0]            same, next 0072
+0072 MOVWI -2[FSR1]           same, next 0073
+0073 ADDFSR FSR0,5            same, next 0074
+0074 ADDFSR FSR1,-3           same, next 0075
+0075 ADDWF STATUS,F           same, next 0076
+0076 MOVWF STATUS             same, next 0077
+0077 CLRF STATUS              same, next 0078
+0078 BSF STATUS,0             same, next 0079
+0079 RLF STATUS,F             same, next 007A
+007A INCF STATUS,F            same, next 007B
+007B SWAPF STATUS,F           same, next 007C
+007C ADDWF INDF0,F (STATUS)   same, next 007D
+007D INCF WREG,F              same, next 007E
+007E ADDWF WREG,W             same, next 007F
+007F INCF FSR0L,F             same, next 0080
+0080 MOVF BSR,W               same, next 0081
+0081 MOVF PCL,W               same, next 0082
+0082 ADDWF PCL,F              same, next 0084
+0085 BRW                      same, next 0086
+0088 NOP                      same, next 0089
+0089 OPTION                   same, next 008A
+008A GOTO                     same, next 008C
+008C BRA +1                   same, next 008E
+0182 BRA -2                   same, next 0181
+008F CALL                     same, next 0100
+0100 RETURN                   same, next 0090
+0090 CALL (RETLW)             same, next 0102
+0102 RETLW 0xA5               same, next 0091
+0091 CALLW                    same, next 0100
+0100 RETURN                   same, next 0092
+0092 CALL (RETFIE)            same, next 0104
+0104 RETFIE                   same, next 0093
+lap 1: 104 instructions
+0089 OPTION                   DIFFERS: INTCON emu 04 part 00   (W=22 STATUS=1F m20=95)
+lap 2: 104 instructions
+lap 3: 104 instructions
+315 comparisons, 1 differ

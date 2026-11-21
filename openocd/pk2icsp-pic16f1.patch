@@ -1847,10 +1847,10 @@ index 4687092..32e0fb5 100644
  	%D%/arm_cti.h \
 diff --git a/src/target/pic16f1.c b/src/target/pic16f1.c
 new file mode 100644
-index 0000000..681473e
+index 0000000..76248a4
 --- /dev/null
 +++ b/src/target/pic16f1.c
-@@ -0,0 +1,1459 @@
+@@ -0,0 +1,2212 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +/*
@@ -1887,8 +1887,10 @@ index 0000000..681473e
 + *    past the 32 bytes return zeros.
 + *
 + * The hardware breakpoint halts AFTER the instruction at its address has
-+ * executed (skid of one instruction). There is one breakpoint, and single
-+ * step uses it. The program counter cannot be changed.
++ * executed (skid of one instruction). There is one, and single step uses
++ * it. Software breakpoints halt before their instruction and there can be
++ * many; see "Software breakpoints" below. The program counter cannot be
++ * changed.
 + */
 +
 +#ifdef HAVE_CONFIG_H
@@ -1918,6 +1920,7 @@ index 0000000..681473e
 +#define CMD_READ   0x01
 +#define CMD_WRITE  0x02
 +#define CMD_GO     0x03
++#define CMD_UNLOCK 0x04    /* EECON2 unlock sequence, then EECON1.WR */
 +
 +/* Debug registers (bank 31) and other places the user's state lives */
 +#define REG_PCL       0xF90
@@ -1933,10 +1936,24 @@ index 0000000..681473e
 +#define REG_EECON1    0x195
 +#define EECON1_RD     0x01
 +#define EECON1_WR     0x02
++#define EECON1_WREN   0x04
++#define EECON1_FREE   0x10
++#define EECON1_LWLO   0x20
 +#define EECON1_CFGS   0x40
 +#define EECON1_EEPGD  0x80
 +#define REG_PCLATH    0x00A
 +#define BREAK_ENABLE  0x80
++
++/* Software breakpoints */
++#define OP_BREAK      0x0002
++#define OP_RETURN     0x0008
++#define OP_CALL       0x2000
++#define PAGE_WORDS    0x800
++#define ROW_WORDS     32       /* words per erase */
++#define LATCH_WORDS   8        /* words per write */
++#define MAX_SW        64
++#define GADGET_UNKNOWN (-1)    /* not looked for yet */
++#define GADGET_NONE    (-2)
 +
 +#define SAVE_W        PIC16F1_SAVE_W
 +#define SAVE_STATUS   PIC16F1_SAVE_STATUS
@@ -1988,6 +2005,20 @@ index 0000000..681473e
 +	 * lost, and by "pic16f1 forget_flash". */
 +	uint16_t code[0x8000];
 +	uint8_t code_valid[0x8000];
++	/* Software breakpoints */
++	int gadget;                  /* offset of the break/RETURN pair in each page, or GADGET_* */
++	uint32_t flash_words;
++	struct pic16f1_sw {
++		bool used;
++		bool wanted;             /* the debugger has it set */
++		bool planted;            /* flash holds CALL gadget at addr */
++		uint16_t addr;           /* word address */
++		uint16_t orig;           /* the instruction it replaces */
++	} sw[MAX_SW];
++	uint32_t real_pc;            /* word PC of the halted core */
++	bool at_site;                /* halted at the gadget, called from a breakpoint */
++	uint16_t site;               /* that breakpoint's word address */
++	uint16_t site_word;          /* its instruction, still to be carried out */
 +};
 +
 +struct pic16f1_reg_arch {
@@ -1999,6 +2030,14 @@ index 0000000..681473e
 +{
 +	return target->arch_info;
 +}
++
++static int settle(struct target *target);
++static int leave_site(struct target *target);
++static int sw_reconcile(struct target *target);
++static struct pic16f1_sw *sw_find(struct pic16f1_common *p, uint32_t word_addr);
++static bool find_gadget(struct target *target);
++static int code_fill(struct target *target, uint32_t first, uint32_t count);
++static bool emu_can(uint16_t word);
 +
 +/* ---- Debug link ------------------------------------------------------------ */
 +
@@ -2192,7 +2231,8 @@ index 0000000..681473e
 +			retval = exec_write8(SAVE_FSR1H, v >> 8);
 +		break;
 +	case R_STKPTR:
-+		retval = exec_write8(REG_STKPTR, v & 0x1F);
++		/* at a software breakpoint the gadget's return address is one above */
++		retval = exec_write8(REG_STKPTR, (v + (pic(target)->at_site ? 1 : 0)) & 0x1F);
 +		break;
 +	default:
 +		if (a->id < R_COMMON)
@@ -2269,14 +2309,20 @@ index 0000000..681473e
 +
 +/* ---- State ------------------------------------------------------------------- */
 +
++/* reason DBG_REASON_UNDEFINED: the target stopped by itself; find out why */
 +static void debug_entry(struct target *target, enum target_debug_reason reason)
 +{
 +	register_cache_invalidate(pic(target)->cache);
 +	target->state = TARGET_HALTED;
-+	target->debug_reason = reason;
++	pic(target)->at_site = false;
 +	/* fill the register cache now, so that "reg" shows values */
 +	if (read_all_regs(target) != ERROR_OK)
 +		LOG_WARNING("pic16f1: could not read the registers");
++	else if (settle(target) != ERROR_OK)
++		LOG_WARNING("pic16f1: could not work out where the target stopped");
++	if (reason == DBG_REASON_UNDEFINED)
++		reason = pic(target)->at_site ? DBG_REASON_BREAKPOINT : DBG_REASON_DBGRQ;
++	target->debug_reason = reason;
 +}
 +
 +void pic16f1_target_link_lost(struct target *target)
@@ -2288,6 +2334,10 @@ index 0000000..681473e
 +	pic(target)->bp_armed = false;
 +	pic(target)->dev_known = false;
 +	memset(pic(target)->code_valid, 0, sizeof(pic(target)->code_valid));
++	/* called when the part is reprogrammed: its breakpoints are gone */
++	memset(pic(target)->sw, 0, sizeof(pic(target)->sw));
++	pic(target)->gadget = GADGET_UNKNOWN;
++	pic(target)->at_site = false;
 +}
 +
 +static int pic16f1_poll(struct target *target)
@@ -2302,7 +2352,7 @@ index 0000000..681473e
 +	if (ready) {
 +		if (target->state != TARGET_HALTED) {
 +			enum target_debug_reason reason = p->bp_armed ?
-+				DBG_REASON_BREAKPOINT : DBG_REASON_DBGRQ;
++				DBG_REASON_BREAKPOINT : DBG_REASON_UNDEFINED;
 +			bool was_debug_running = target->state == TARGET_DEBUG_RUNNING;
 +
 +			p->bp_armed = false;
@@ -2361,6 +2411,11 @@ index 0000000..681473e
 +	struct pic16f1_common *p = pic(target);
 +	int retval;
 +
++	retval = leave_site(target);
++	if (retval == ERROR_OK)
++		retval = sw_reconcile(target);
++	if (retval != ERROR_OK)
++		return retval;
 +	if (p->bp) {
 +		retval = set_breakpoint_hw(p->bp->address / 2);
 +		p->bp_armed = true;
@@ -2403,7 +2458,6 @@ index 0000000..681473e
 +		int handle_breakpoints)
 +{
 +	struct pic16f1_common *p = pic(target);
-+	uint32_t pc;
 +	bool ready;
 +
 +	if (target->state != TARGET_HALTED) {
@@ -2415,12 +2469,14 @@ index 0000000..681473e
 +		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
 +	}
 +
-+	int retval = read_pc_word(target, &pc);
++	/* At a software breakpoint the step is the replaced instruction: its
++	 * work is done here and the target executes the gadget's RETURN. */
++	int retval = leave_site(target);
 +	if (retval != ERROR_OK)
 +		return retval;
 +
 +	/* A breakpoint on the current instruction: exactly one instruction runs */
-+	retval = set_breakpoint_hw(pc);
++	retval = set_breakpoint_hw(p->real_pc);
 +	if (retval == ERROR_OK)
 +		retval = exec_go();
 +	if (retval != ERROR_OK)
@@ -2561,14 +2617,54 @@ index 0000000..681473e
 +
 +	if (target->state != TARGET_HALTED)
 +		return ERROR_TARGET_NOT_HALTED;
-+	if (breakpoint->type != BKPT_HARD) {
-+		LOG_ERROR("pic16f1: only a hardware breakpoint is available (bp <addr> 2 hw; "
-+			"for gdb use 'gdb_breakpoint_override hard')");
-+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-+	}
 +	if (breakpoint->address & 1 || breakpoint->address >= 0x10000) {
 +		LOG_ERROR("pic16f1: breakpoint address must be an even byte address (2 * word address) below 0x10000");
 +		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++	}
++	if (breakpoint->type != BKPT_HARD) {
++		uint32_t word = breakpoint->address / 2;
++		struct pic16f1_sw *s = sw_find(p, word);
++
++		if (s) {                     /* still in flash from before */
++			s->wanted = true;
++			breakpoint->is_set = true;
++			return ERROR_OK;
++		}
++		if (!find_gadget(target)) {
++			LOG_ERROR("pic16f1: no software breakpoints: the program was not loaded with "
++				"'pic16f1 load_debug', or left no two words free at one offset of every "
++				"page. The hardware breakpoint is 'bp <addr> 2 hw'");
++			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++		}
++		if (word >= p->flash_words || word % PAGE_WORDS == (uint32_t)p->gadget ||
++				word % PAGE_WORDS == (uint32_t)p->gadget + 1) {
++			LOG_ERROR("pic16f1: 0x%" TARGET_PRIxADDR " is not an address a breakpoint can go",
++				breakpoint->address);
++			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++		}
++		int retval = code_fill(target, word, 1);
++		if (retval != ERROR_OK)
++			return retval;
++		if (!emu_can(p->code[word])) {
++			LOG_ERROR("pic16f1: the instruction at 0x%" TARGET_PRIxADDR " (0x%04x: RESET, SLEEP or "
++				"CLRWDT) cannot take a software breakpoint; use the hardware breakpoint",
++				breakpoint->address, p->code[word]);
++			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++		}
++		for (unsigned int i = 0; i < MAX_SW && !s; i++)
++			if (!p->sw[i].used)
++				s = &p->sw[i];
++		if (!s) {
++			LOG_ERROR("pic16f1: no more than %d software breakpoints", MAX_SW);
++			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
++		}
++		s->used = true;
++		s->wanted = true;
++		s->planted = false;          /* flash is written when the target next runs */
++		s->addr = word;
++		s->orig = p->code[word];
++		breakpoint->is_set = true;
++		return ERROR_OK;
 +	}
 +	if (p->bp) {
 +		LOG_ERROR("pic16f1: there is only one hardware breakpoint");
@@ -2587,6 +2683,16 @@ index 0000000..681473e
 +
 +	if (p->bp == breakpoint)
 +		p->bp = NULL;
++	if (breakpoint->type != BKPT_HARD) {
++		struct pic16f1_sw *s = sw_find(p, breakpoint->address / 2);
++
++		/* flash is put back when the target next runs, unless the
++		 * debugger has set the breakpoint again by then */
++		if (s && s->planted)
++			s->wanted = false;
++		else if (s)
++			s->used = false;
++	}
 +	breakpoint->is_set = false;
 +	return ERROR_OK;
 +}
@@ -2712,6 +2818,637 @@ index 0000000..681473e
 +	return p->dev;
 +}
 +
++/* ---- Software breakpoints -------------------------------------------------------
++ *
++ * docs/icd.md, experiments D14 to D17. "pic16f1 load_debug" puts a two-word
++ * gadget in flash the image leaves blank, at the same offset of every page:
++ *
++ *     G:    0x0002   break
++ *     G+1:  RETURN
++ *
++ * A breakpoint replaces its instruction with CALL G. The target then stops
++ * at G+1 with the breakpoint address + 1 on top of the return stack. The
++ * debugger is shown pc = the breakpoint address and the stack without that
++ * entry. To go on, the entry is popped, the work of the replaced instruction
++ * is done here by memory access (emu_execute), the address of the next
++ * instruction is pushed, and the target resumes into the RETURN.
++ *
++ * Flash is rewritten a row at a time by the part itself, and only when the
++ * target is about to run: debuggers remove and re-insert breakpoints around
++ * every step, which must not cost an erase cycle each time.
++ */
++
++static struct pic16f1_sw *sw_find(struct pic16f1_common *p, uint32_t word_addr)
++{
++	for (unsigned int i = 0; i < MAX_SW; i++)
++		if (p->sw[i].used && p->sw[i].addr == word_addr)
++			return &p->sw[i];
++	return NULL;
++}
++
++/* Fill the program memory cache for a range. The cache holds the program:
++ * where a breakpoint is planted, the instruction it replaced. */
++static int code_fill(struct target *target, uint32_t first, uint32_t count)
++{
++	struct pic16f1_common *p = pic(target);
++
++	for (uint32_t i = 0; i < count;) {
++		uint32_t run = 0;
++
++		while (i + run < count && !p->code_valid[first + i + run])
++			run++;
++		if (run) {
++			int retval = nvm_read_words(EECON1_EEPGD, first + i, run, &p->code[first + i]);
++			if (retval != ERROR_OK)
++				return retval;
++			memset(&p->code_valid[first + i], 1, run);
++			for (unsigned int j = 0; j < MAX_SW; j++) {
++				const struct pic16f1_sw *s = &p->sw[j];
++				if (s->used && s->planted && s->addr >= first + i && s->addr < first + i + run)
++					p->code[s->addr] = s->orig;
++			}
++		}
++		i += run + 1;
++	}
++	return ERROR_OK;
++}
++
++/* Find the gadget in a target that this process did not load. */
++static bool find_gadget(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++
++	if (p->gadget == GADGET_UNKNOWN) {
++		const struct pic16f1_device *dev = halted_device(target);
++
++		p->gadget = GADGET_NONE;
++		if (!dev)
++			return false;
++		p->flash_words = dev->flash_words;
++		uint32_t last = dev->flash_words - PAGE_WORDS;
++		for (int k = PAGE_WORDS - 2; k >= PAGE_WORDS - 64; k--) {
++			if (code_fill(target, k, 2) != ERROR_OK)
++				return false;
++			if (p->code[k] != OP_BREAK || p->code[k + 1] != OP_RETURN)
++				continue;
++			if (code_fill(target, last + k, 2) != ERROR_OK)
++				return false;
++			if (p->code[last + k] == OP_BREAK && p->code[last + k + 1] == OP_RETURN) {
++				p->gadget = k;
++				LOG_INFO("pic16f1: software breakpoint gadget found at offset 0x%03x of each page", k);
++				break;
++			}
++		}
++	}
++	return p->gadget >= 0;
++}
++
++/* Erase a row of program memory and write it again; the part does it. */
++static int nvm_rewrite_row(uint32_t base, const uint16_t *row)
++{
++	static const uint32_t regs[5] = { REG_EEADRL, REG_EEADRH, REG_EEDATL, REG_EEDATH, REG_EECON1 };
++	static const uint8_t unlock[] = { CMD_UNLOCK };
++	uint8_t saved[5];
++	uint16_t back[ROW_WORDS];
++	int retval = exec_read_batch(regs, 5, saved);
++
++	if (retval != ERROR_OK)
++		return retval;
++	queue_write8(REG_EEADRL, base & 0xFF);
++	queue_write8(REG_EEADRH, base >> 8);
++	queue_write8(REG_EECON1, EECON1_EEPGD | EECON1_FREE | EECON1_WREN);
++	icsp_icd_queue(unlock, 1, 0);
++	if (icsp_flush(NULL, 0) != ERROR_OK)
++		return link_error("row erase");
++	for (unsigned int i = 0; i < ROW_WORDS; i += LATCH_WORDS) {
++		bool blank = true;
++
++		for (unsigned int j = 0; j < LATCH_WORDS; j++)
++			blank = blank && row[i + j] == PIC16F1_BLANK;
++		if (blank)
++			continue;
++		for (unsigned int j = 0; j < LATCH_WORDS; j++) {
++			queue_write8(REG_EEADRL, (base + i + j) & 0xFF);
++			queue_write8(REG_EEDATL, row[i + j] & 0xFF);
++			queue_write8(REG_EEDATH, row[i + j] >> 8);
++			queue_write8(REG_EECON1, EECON1_EEPGD | EECON1_WREN |
++				(j == LATCH_WORDS - 1 ? 0 : EECON1_LWLO));
++			icsp_icd_queue(unlock, 1, 0);
++		}
++		if (icsp_flush(NULL, 0) != ERROR_OK)
++			return link_error("row write");
++	}
++	for (unsigned int i = 0; i < 4; i++)
++		queue_write8(regs[i], saved[i]);
++	queue_write8(REG_EECON1, saved[4] & ~(EECON1_RD | EECON1_WR | EECON1_WREN | EECON1_FREE | EECON1_LWLO));
++	if (icsp_flush(NULL, 0) != ERROR_OK)
++		return link_error("row write");
++
++	retval = nvm_read_words(EECON1_EEPGD, base, ROW_WORDS, back);
++	if (retval != ERROR_OK)
++		return retval;
++	for (unsigned int i = 0; i < ROW_WORDS; i++) {
++		if (back[i] != row[i]) {
++			LOG_ERROR("pic16f1: program memory 0x%04" PRIx32 ": wrote 0x%04x, read 0x%04x; is the "
++				"program memory write protected (WRT)? The row at 0x%04" PRIx32 " may be damaged",
++				base + i, row[i], back[i], base);
++			return ERROR_FAIL;
++		}
++	}
++	return ERROR_OK;
++}
++
++/* Make flash agree with the breakpoints the debugger wants. */
++static int sw_reconcile(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++
++	for (unsigned int i = 0; i < MAX_SW; i++) {
++		const struct pic16f1_sw *s = &p->sw[i];
++		uint16_t row[ROW_WORDS];
++
++		if (!s->used || s->planted == s->wanted)
++			continue;
++		uint32_t base = s->addr & ~(ROW_WORDS - 1U);
++		int retval = code_fill(target, base, ROW_WORDS);
++		if (retval != ERROR_OK)
++			return retval;
++		memcpy(row, &p->code[base], sizeof(row));
++		for (unsigned int j = 0; j < MAX_SW; j++) {
++			const struct pic16f1_sw *t = &p->sw[j];
++			if (t->used && t->wanted && (t->addr & ~(ROW_WORDS - 1U)) == base)
++				row[t->addr - base] = OP_CALL | p->gadget;
++		}
++		retval = nvm_rewrite_row(base, row);
++		if (retval != ERROR_OK)
++			return retval;
++		for (unsigned int j = 0; j < MAX_SW; j++) {
++			struct pic16f1_sw *t = &p->sw[j];
++			if (t->used && (t->addr & ~(ROW_WORDS - 1U)) == base) {
++				t->planted = t->wanted;
++				t->used = t->wanted;
++			}
++		}
++	}
++	return ERROR_OK;
++}
++
++/* Let the target execute one instruction from flash, without telling anyone. */
++static int raw_step(struct pic16f1_common *p)
++{
++	static const uint32_t addrs[] = { REG_PCL, REG_PCH };
++	uint8_t v[2];
++	bool ready;
++	int retval = set_breakpoint_hw(p->real_pc);
++
++	if (retval == ERROR_OK)
++		retval = exec_go();
++	if (retval == ERROR_OK)
++		retval = icd_wait_ready(1000, &ready);
++	if (retval != ERROR_OK)
++		return retval;
++	if (!ready) {
++		LOG_ERROR("pic16f1: the target did not come back from a single step");
++		return ERROR_TARGET_FAILURE;
++	}
++	retval = exec_read_batch(addrs, 2, v);
++	if (retval == ERROR_OK)
++		p->real_pc = v[0] | ((v[1] & 0x7F) << 8);
++	return retval;
++}
++
++/*
++ * Called at every halt, with the registers read. A target that stopped on
++ * the way into a software breakpoint (on its CALL, or on the break) is taken
++ * the rest of the way in, so that there is one stopped-at-a-breakpoint state.
++ * In that state pc and stkptr are shown as they would be without the gadget.
++ */
++static int settle(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	bool moved = false;
++
++	p->at_site = false;
++	p->real_pc = buf_get_u32(p->cache->reg_list[R_PC].value, 0, 32) / 2;
++	if (p->gadget < 0)
++		return ERROR_OK;
++
++	for (unsigned int i = 0; i < 2; i++) {
++		const struct pic16f1_sw *s = sw_find(p, p->real_pc);
++
++		if (p->real_pc >= p->flash_words ||
++				!((s && s->planted) || p->real_pc % PAGE_WORDS == (uint32_t)p->gadget))
++			break;
++		int retval = raw_step(p);
++		if (retval != ERROR_OK)
++			return retval;
++		moved = true;
++	}
++	if (moved) {
++		register_cache_invalidate(p->cache);
++		int retval = read_all_regs(target);
++		if (retval != ERROR_OK)
++			return retval;
++	}
++	if (p->real_pc < p->flash_words && p->real_pc % PAGE_WORDS == (uint32_t)p->gadget + 1) {
++		static const uint32_t addrs[] = { REG_TOSL, REG_TOSH, REG_STKPTR };
++		uint8_t v[3];
++		int retval = exec_read_batch(addrs, 3, v);
++
++		if (retval != ERROR_OK)
++			return retval;
++		uint32_t site = ((v[0] | (v[1] << 8)) - 1) & 0x7FFF;
++		const struct pic16f1_sw *s = sw_find(p, site);
++		if (s && s->planted) {
++			p->at_site = true;
++			p->site = site;
++			p->site_word = s->orig;
++			reg_store(target, R_PC, 2 * site);
++			reg_store(target, R_STKPTR, (v[2] - 1) & 0x1F);
++		} else {
++			LOG_WARNING("pic16f1: stopped in the breakpoint gadget, called from word 0x%04" PRIx32
++				" where this session has no breakpoint; the instruction replaced there is "
++				"not known and will be skipped. Load the program again (pic16f1 load_debug)", site);
++		}
++	}
++	return ERROR_OK;
++}
++
++/* -- Doing the work of one instruction (a port of host/emu16f1.py) -- */
++
++struct emu {
++	int err;
++	uint32_t addr, next;
++};
++
++static uint8_t emu_rd(struct emu *e, uint32_t a)
++{
++	uint8_t v = 0;
++
++	if (e->err != ERROR_OK)
++		return 0;
++	if (a < 0x1000 && (a & 0x7F) == 0x03) {
++		e->err = exec_read8(SAVE_STATUS, &v);
++		return swap_nibbles(v);
++	}
++	e->err = exec_read8(map_addr(a), &v);
++	return v;
++}
++
++static void emu_wr(struct emu *e, uint32_t a, uint8_t v)
++{
++	if (e->err != ERROR_OK)
++		return;
++	if (a < 0x1000 && (a & 0x7F) == 0x03)
++		e->err = exec_write8(SAVE_STATUS, swap_nibbles(v));
++	else
++		e->err = exec_write8(map_addr(a), v);
++}
++
++static void emu_push(struct emu *e, uint32_t pc)
++{
++	emu_wr(e, REG_STKPTR, (emu_rd(e, REG_STKPTR) + 1) & 0x1F);
++	emu_wr(e, REG_TOSL, pc & 0xFF);
++	emu_wr(e, REG_TOSH, (pc >> 8) & 0x7F);
++}
++
++static uint32_t emu_pop(struct emu *e)
++{
++	uint8_t sp = emu_rd(e, REG_STKPTR) & 0x1F;
++
++	if (e->err == ERROR_OK && sp > 15) {
++		LOG_ERROR("pic16f1: the return stack is empty");
++		e->err = ERROR_FAIL;
++	}
++	uint32_t pc = emu_rd(e, REG_TOSL);
++	pc |= emu_rd(e, REG_TOSH) << 8;
++	emu_wr(e, REG_STKPTR, (sp - 1) & 0x1F);
++	return pc;
++}
++
++enum { E_PCL = 2, E_STATUS = 3, E_FSR0L = 4, E_BSR = 8, E_WREG = 9, E_PCLATH = 10, E_INTCON = 11 };
++#define F_C  0x01
++#define F_DC 0x02
++#define F_Z  0x04
++
++static bool emu_can(uint16_t word)
++{
++	return word != 0x0001 && word != 0x0063 && word != 0x0064;   /* RESET, SLEEP, CLRWDT */
++}
++
++static void emu_jump(struct emu *e, uint32_t pc)
++{
++	e->next = pc & 0x7FFF;
++}
++
++/* set the flags in mask to the values in bits */
++static void emu_flags(struct emu *e, uint8_t mask, uint8_t bits)
++{
++	emu_wr(e, E_STATUS, (emu_rd(e, E_STATUS) & ~mask) | (bits & mask));
++}
++
++static uint32_t emu_fsr(struct emu *e, unsigned int n)
++{
++	uint32_t v = emu_rd(e, E_FSR0L + 2 * n);
++	return v | emu_rd(e, E_FSR0L + 2 * n + 1) << 8;
++}
++
++static void emu_set_fsr(struct emu *e, unsigned int n, uint32_t v)
++{
++	emu_wr(e, E_FSR0L + 2 * n, v & 0xFF);
++	emu_wr(e, E_FSR0L + 2 * n + 1, (v >> 8) & 0xFF);
++}
++
++static bool emu_is_status(uint32_t a)
++{
++	return a < 0x1000 && (a & 0x7F) == E_STATUS;
++}
++
++/* read a data address: register file, or what an FSR holds */
++static uint8_t emu_get(struct emu *e, uint32_t a)
++{
++	a &= 0xFFFF;
++	if (a < 0x1000) {
++		if ((a & 0x7F) < 2)
++			return 0;                       /* INDF read through INDF */
++		if ((a & 0x7F) == E_PCL)
++			return (e->addr + 1) & 0xFF;
++	}
++	return emu_rd(e, a);
++}
++
++static void emu_put(struct emu *e, uint32_t a, uint8_t v)
++{
++	a &= 0xFFFF;
++	if (a >= 0x8000)
++		return;                             /* program memory is not written this way */
++	if (a < 0x1000) {
++		if ((a & 0x7F) < 2)
++			return;
++		if ((a & 0x7F) == E_PCL) {
++			emu_jump(e, (emu_rd(e, E_PCLATH) & 0x7F) << 8 | v);
++			return;
++		}
++		if ((a & 0x7F) == E_STATUS)
++			v = (v & 0x07) | (emu_rd(e, E_STATUS) & 0x18);   /* TO and PD cannot be written */
++	}
++	emu_wr(e, a, v);
++}
++
++/* data address of a 7 bit file operand */
++static uint32_t emu_ea(struct emu *e, unsigned int f)
++{
++	if (f < 2)
++		return emu_fsr(e, f);
++	if (f < 0x0C)
++		return f;
++	return (emu_rd(e, E_BSR) & 0x1F) << 7 | f;
++}
++
++/* Store a result. When an instruction that sets a flag has STATUS as its
++ * destination, the part does not write C, DC and Z from the result (D16). */
++static void emu_result(struct emu *e, bool to_f, uint32_t a, unsigned int r, bool sets_flags)
++{
++	if (!to_f)
++		emu_wr(e, E_WREG, r & 0xFF);
++	else if (!(sets_flags && emu_is_status(a)))
++		emu_put(e, a, r & 0xFF);
++}
++
++static int emu_signed(unsigned int v, unsigned int bits)
++{
++	return (v & (1U << (bits - 1))) ? (int)v - (1 << bits) : (int)v;
++}
++
++/* Do the work of instruction word, located at addr. *next is the address of
++ * the instruction that follows it in execution. */
++static int emu_execute(uint16_t word, uint32_t addr, uint32_t *next)
++{
++	struct emu emu = { ERROR_OK, addr, (addr + 1) & 0x7FFF }, *e = &emu;
++	unsigned int hi = word >> 8, f = word & 0x7F, k = word & 0xFF;
++	bool to_f = word & 0x80;
++
++	if (word < 0x80) {
++		if (word == 0x08) {                                 /* RETURN */
++			emu_jump(e, emu_pop(e));
++		} else if (word == 0x09) {                          /* RETFIE */
++			static const uint16_t shadow[8][2] = {
++				{ 0xFE4, E_STATUS }, { 0xFE5, E_WREG }, { 0xFE6, E_BSR }, { 0xFE7, E_PCLATH },
++				{ 0xFE8, 4 }, { 0xFE9, 5 }, { 0xFEA, 6 }, { 0xFEB, 7 },
++			};
++			for (unsigned int i = 0; i < 8; i++)
++				emu_put(e, shadow[i][1], emu_rd(e, shadow[i][0]));
++			emu_jump(e, emu_pop(e));
++			emu_wr(e, E_INTCON, emu_rd(e, E_INTCON) | 0x80);
++		} else if (word == 0x0A) {                          /* CALLW */
++			emu_push(e, e->next);
++			emu_jump(e, (emu_rd(e, E_PCLATH) & 0x7F) << 8 | emu_rd(e, E_WREG));
++		} else if (word == 0x0B) {                          /* BRW */
++			emu_jump(e, e->next + emu_rd(e, E_WREG));
++		} else if (word >= 0x10 && word <= 0x1F) {          /* MOVIW / MOVWI with ++ -- */
++			unsigned int n = (word >> 2) & 1, mode = word & 3;
++			uint32_t a = emu_fsr(e, n);
++
++			if (mode == 0)
++				a = (a + 1) & 0xFFFF;
++			else if (mode == 1)
++				a = (a - 1) & 0xFFFF;
++			if (word & 8) {
++				emu_put(e, a, emu_rd(e, E_WREG));
++			} else {
++				uint8_t v = emu_get(e, a);
++				emu_wr(e, E_WREG, v);
++				emu_flags(e, F_Z, v ? 0 : F_Z);
++			}
++			if (mode == 2)
++				a++;
++			else if (mode == 3)
++				a--;
++			emu_set_fsr(e, n, a & 0xFFFF);
++		} else if (word >= 0x20 && word <= 0x3F) {          /* MOVLB */
++			emu_wr(e, E_BSR, word & 0x1F);
++		} else if (word == 0x62) {                          /* OPTION */
++			emu_wr(e, 0x095, emu_rd(e, E_WREG));
++		} else if (word >= 0x65 && word <= 0x67) {          /* TRIS */
++			emu_wr(e, 0x08C + word - 0x65, emu_rd(e, E_WREG));
++		} else if (!emu_can(word)) {
++			LOG_ERROR("pic16f1: instruction 0x%04x cannot be carried out by the debugger", word);
++			return ERROR_FAIL;
++		}
++		/* everything else here is a NOP */
++	} else if (hi == 0x00) {                                /* MOVWF */
++		emu_put(e, emu_ea(e, f), emu_rd(e, E_WREG));
++	} else if (hi == 0x01) {                                /* CLRF / CLRW */
++		emu_result(e, to_f, to_f ? emu_ea(e, f) : 0, 0, true);
++		emu_flags(e, F_Z, F_Z);
++	} else if (hi <= 0x0F || hi == 0x35 || hi == 0x36 || hi == 0x37 || hi == 0x3B || hi == 0x3D) {
++		uint32_t a = emu_ea(e, f);
++		unsigned int v = emu_get(e, a), w, cin, r;
++		uint8_t mask = 0, bits = 0;
++		bool skip = false;
++
++		switch (hi) {
++		case 0x02: case 0x3B:                               /* SUBWF, SUBWFB */
++		case 0x07: case 0x3D:                               /* ADDWF, ADDWFC */
++			w = emu_rd(e, E_WREG);
++			if (hi == 0x02 || hi == 0x3B)
++				w = ~w & 0xFF;
++			cin = hi == 0x02 ? 1 : hi == 0x07 ? 0 : emu_rd(e, E_STATUS) & 1;
++			r = v + w + cin;
++			mask = F_C | F_DC | F_Z;
++			bits = (r > 0xFF ? F_C : 0) | ((v & 15) + (w & 15) + cin > 15 ? F_DC : 0) |
++				((r & 0xFF) ? 0 : F_Z);
++			break;
++		case 0x03: case 0x0A:                               /* DECF, INCF */
++			r = v + (hi == 0x0A ? 1 : 0xFF);
++			mask = F_Z;
++			bits = (r & 0xFF) ? 0 : F_Z;
++			break;
++		case 0x04: case 0x05: case 0x06:                    /* IORWF, ANDWF, XORWF */
++			w = emu_rd(e, E_WREG);
++			r = hi == 0x04 ? (v | w) : hi == 0x05 ? (v & w) : (v ^ w);
++			mask = F_Z;
++			bits = r ? 0 : F_Z;
++			break;
++		case 0x08:                                          /* MOVF */
++			r = v;
++			mask = F_Z;
++			bits = r ? 0 : F_Z;
++			break;
++		case 0x09:                                          /* COMF */
++			r = ~v & 0xFF;
++			mask = F_Z;
++			bits = r ? 0 : F_Z;
++			break;
++		case 0x0B: case 0x0F:                               /* DECFSZ, INCFSZ */
++			r = v + (hi == 0x0F ? 1 : 0xFF);
++			skip = (r & 0xFF) == 0;
++			break;
++		case 0x0C:                                          /* RRF */
++			r = v >> 1 | (emu_rd(e, E_STATUS) & 1) << 7;
++			mask = F_C;
++			bits = (v & 1) ? F_C : 0;
++			break;
++		case 0x0D:                                          /* RLF */
++			r = v << 1 | (emu_rd(e, E_STATUS) & 1);
++			mask = F_C;
++			bits = (v & 0x80) ? F_C : 0;
++			break;
++		case 0x0E:                                          /* SWAPF */
++			r = v << 4 | v >> 4;
++			break;
++		case 0x35:                                          /* LSLF */
++			r = v << 1;
++			mask = F_C | F_Z;
++			bits = ((v & 0x80) ? F_C : 0) | ((r & 0xFF) ? 0 : F_Z);
++			break;
++		case 0x36:                                          /* LSRF */
++			r = v >> 1;
++			mask = F_C | F_Z;
++			bits = ((v & 1) ? F_C : 0) | (r ? 0 : F_Z);
++			break;
++		default:                                            /* 0x37 ASRF */
++			r = v >> 1 | (v & 0x80);
++			mask = F_C | F_Z;
++			bits = ((v & 1) ? F_C : 0) | (r ? 0 : F_Z);
++			break;
++		}
++		emu_result(e, to_f, a, r, mask != 0);
++		if (mask)
++			emu_flags(e, mask, bits);
++		if (skip)
++			emu_jump(e, addr + 2);
++	} else if (hi < 0x20) {                                 /* bit operations */
++		uint32_t a = emu_ea(e, f);
++		uint8_t bit = 1 << ((word >> 7) & 7), v = emu_get(e, a);
++		unsigned int kind = hi >> 2;
++
++		if (kind == 4)                                      /* BCF */
++			emu_put(e, a, v & ~bit);
++		else if (kind == 5)                                 /* BSF */
++			emu_put(e, a, v | bit);
++		else if (!!(v & bit) == (kind == 7))                /* BTFSC, BTFSS */
++			emu_jump(e, addr + 2);
++	} else if (hi < 0x30) {                                 /* CALL, GOTO */
++		if (hi < 0x28)
++			emu_push(e, e->next);
++		emu_jump(e, (emu_rd(e, E_PCLATH) & 0x78) << 8 | (word & 0x7FF));
++	} else if (hi == 0x30) {                                /* MOVLW */
++		emu_wr(e, E_WREG, k);
++	} else if (hi == 0x31) {
++		if (to_f) {                                         /* MOVLP */
++			emu_wr(e, E_PCLATH, word & 0x7F);
++		} else {                                            /* ADDFSR */
++			unsigned int n = (word >> 6) & 1;
++			emu_set_fsr(e, n, (emu_fsr(e, n) + emu_signed(word & 0x3F, 6)) & 0xFFFF);
++		}
++	} else if (hi == 0x32 || hi == 0x33) {                  /* BRA */
++		emu_jump(e, e->next + emu_signed(word & 0x1FF, 9));
++	} else if (hi == 0x34) {                                /* RETLW */
++		emu_wr(e, E_WREG, k);
++		emu_jump(e, emu_pop(e));
++	} else if (hi == 0x38 || hi == 0x39 || hi == 0x3A) {    /* IORLW, ANDLW, XORLW */
++		unsigned int w = emu_rd(e, E_WREG);
++		unsigned int r = hi == 0x38 ? (w | k) : hi == 0x39 ? (w & k) : (w ^ k);
++
++		emu_wr(e, E_WREG, r);
++		emu_flags(e, F_Z, r ? 0 : F_Z);
++	} else if (hi == 0x3C || hi == 0x3E) {                  /* SUBLW, ADDLW */
++		unsigned int w = emu_rd(e, E_WREG), cin = hi == 0x3C ? 1 : 0;
++
++		if (hi == 0x3C)
++			w = ~w & 0xFF;
++		unsigned int r = k + w + cin;
++		emu_wr(e, E_WREG, r & 0xFF);
++		emu_flags(e, F_C | F_DC | F_Z, (r > 0xFF ? F_C : 0) |
++			((k & 15) + (w & 15) + cin > 15 ? F_DC : 0) | ((r & 0xFF) ? 0 : F_Z));
++	} else {                                                /* 0x3F: MOVIW / MOVWI k[FSRn] */
++		unsigned int n = (word >> 6) & 1;
++		uint32_t a = (emu_fsr(e, n) + emu_signed(word & 0x3F, 6)) & 0xFFFF;
++
++		if (to_f) {
++			emu_put(e, a, emu_rd(e, E_WREG));
++		} else {
++			uint8_t v = emu_get(e, a);
++			emu_wr(e, E_WREG, v);
++			emu_flags(e, F_Z, v ? 0 : F_Z);
++		}
++	}
++	*next = e->next;
++	return e->err;
++}
++
++/*
++ * Before the target runs again from a software breakpoint: take the
++ * gadget's return address off the stack, do the work of the instruction the
++ * breakpoint replaced, and leave the address of the next instruction for the
++ * gadget's RETURN. The target stays halted at that RETURN.
++ */
++static int leave_site(struct target *target)
++{
++	struct pic16f1_common *p = pic(target);
++	struct emu e = { ERROR_OK, 0, 0 };
++	uint32_t next = 0;
++
++	if (!p->at_site)
++		return ERROR_OK;
++	emu_pop(&e);
++	if (e.err != ERROR_OK)
++		return e.err;
++	int retval = emu_execute(p->site_word, p->site, &next);
++	if (retval != ERROR_OK) {
++		LOG_ERROR("pic16f1: the instruction at the software breakpoint (word 0x%04x, 0x%04x) "
++			"was not carried out completely", p->site, p->site_word);
++		return retval;
++	}
++	emu_push(&e, next);
++	if (e.err != ERROR_OK)
++		return e.err;
++	p->at_site = false;
++	register_cache_invalidate(p->cache);
++	return ERROR_OK;
++}
++
 +int pic16f1_target_identify(struct target *target, const struct pic16f1_device **dev,
 +		uint16_t *dev_word)
 +{
@@ -2766,20 +3503,10 @@ index 0000000..681473e
 +		return ERROR_FAIL;
 +	int retval = ERROR_OK;
 +	if (con == EECON1_EEPGD) {
-+		/* program memory: read the runs that are not cached yet */
-+		struct pic16f1_common *p = pic(target);
-+		for (uint32_t i = 0; i < nwords && retval == ERROR_OK;) {
-+			uint32_t run = 0;
-+			while (i + run < nwords && !p->code_valid[first + i + run])
-+				run++;
-+			if (run) {
-+				retval = nvm_read_words(con, first + i, run, &p->code[first + i]);
-+				if (retval == ERROR_OK)
-+					memset(&p->code_valid[first + i], 1, run);
-+			}
-+			i += run + 1;
-+		}
-+		memcpy(words, &p->code[first], nwords * sizeof(uint16_t));
++		/* program memory: read what is not cached yet. The debugger sees
++		 * the program, not the breakpoints planted in it. */
++		retval = code_fill(target, first, nwords);
++		memcpy(words, &pic(target)->code[first], nwords * sizeof(uint16_t));
 +	} else {
 +		retval = nvm_read_words(con, first, nwords, words);
 +	}
@@ -3024,6 +3751,27 @@ index 0000000..681473e
 +	}
 +	img.cfg[PIC16F1_CONFIG2_ADDR - 0x8000] &= ~PIC16F1_CONFIG2_DEBUG;
 +
++	/* the software breakpoint gadget: the highest offset at which two
++	 * words are blank in every page of the image */
++	int gadget = GADGET_NONE;
++	for (int k = PAGE_WORDS - 2; k >= 8 && gadget < 0; k--) {
++		bool blank = true;
++		for (uint32_t page = 0; page < dev->flash_words; page += PAGE_WORDS)
++			blank = blank && img.flash[page + k] == PIC16F1_BLANK &&
++				img.flash[page + k + 1] == PIC16F1_BLANK;
++		if (blank)
++			gadget = k;
++	}
++	if (gadget >= 0) {
++		for (uint32_t page = 0; page < dev->flash_words; page += PAGE_WORDS) {
++			img.flash[page + gadget] = OP_BREAK;
++			img.flash[page + gadget + 1] = OP_RETURN;
++		}
++	} else {
++		LOG_WARNING("pic16f1: the image leaves no two words free at one offset of every page; "
++			"software breakpoints will not be available");
++	}
++
 +	retval = pic16f1_bulk_erase(dev);
 +	if (retval == ERROR_OK)
 +		retval = erase_exec_rows();
@@ -3102,6 +3850,10 @@ index 0000000..681473e
 +		retval = pic16f1_write_config_words(0x8000 + idx, &img.cfg[idx], 1);
 +		if (retval == ERROR_OK)
 +			retval = verify_words(0x8000 + idx, &img.cfg[idx], 1, "config");
++	}
++	if (retval == ERROR_OK) {
++		pic(target)->gadget = gadget;
++		pic(target)->flash_words = dev->flash_words;
 +	}
 +done:
 +	pic16f1_image_free(&img);
@@ -3227,6 +3979,7 @@ index 0000000..681473e
 +	if (!p)
 +		return ERROR_FAIL;
 +	p->magic = PIC16F1_MAGIC;
++	p->gadget = GADGET_UNKNOWN;
 +	target->arch_info = p;
 +	target->endianness = TARGET_LITTLE_ENDIAN;
 +	return ERROR_OK;
@@ -3312,10 +4065,10 @@ index 0000000..681473e
 +};
 diff --git a/src/target/pic16f1_exec.h b/src/target/pic16f1_exec.h
 new file mode 100644
-index 0000000..7e2714b
+index 0000000..48effe1
 --- /dev/null
 +++ b/src/target/pic16f1_exec.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,72 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +
 +/*
@@ -3328,7 +4081,7 @@ index 0000000..7e2714b
 + * (run from the project root; the interpreter needs pyusb because
 + * host/icd16f1.py imports host/pk2probe.py).
 + *
-+ * 121 words, addresses are in the 0x8000 debug/configuration space.
++ * 134 words, addresses are in the 0x8000 debug/configuration space.
 + */
 +
 +#ifndef OPENOCD_TARGET_PIC16F1_EXEC_H
@@ -3348,41 +4101,44 @@ index 0000000..7e2714b
 +	uint16_t word;
 +};
 +
-+static const struct pic16f1_exec_word pic16f1_exec[121] = {
++static const struct pic16f1_exec_word pic16f1_exec[134] = {
 +	{ 0x8004, 0x2810 }, { 0x8010, 0x0026 }, { 0x8011, 0x00A0 }, { 0x8012, 0x0E03 },
 +	{ 0x8013, 0x00A1 }, { 0x8014, 0x0804 }, { 0x8015, 0x00A2 }, { 0x8016, 0x0805 },
 +	{ 0x8017, 0x00A3 }, { 0x8018, 0x0806 }, { 0x8019, 0x00A4 }, { 0x801A, 0x0807 },
 +	{ 0x801B, 0x00A5 }, { 0x801C, 0x308C }, { 0x801D, 0x0086 }, { 0x801E, 0x300F },
-+	{ 0x801F, 0x0087 }, { 0x8020, 0x2069 }, { 0x8021, 0x3A01 }, { 0x8022, 0x1903 },
-+	{ 0x8023, 0x2839 }, { 0x8024, 0x3A03 }, { 0x8025, 0x1903 }, { 0x8026, 0x2840 },
-+	{ 0x8027, 0x3A01 }, { 0x8028, 0x1D03 }, { 0x8029, 0x2820 }, { 0x802A, 0x300C },
-+	{ 0x802B, 0x0081 }, { 0x802C, 0x0824 }, { 0x802D, 0x0086 }, { 0x802E, 0x0825 },
-+	{ 0x802F, 0x0087 }, { 0x8030, 0x0822 }, { 0x8031, 0x0084 }, { 0x8032, 0x0823 },
-+	{ 0x8033, 0x0085 }, { 0x8034, 0x0E21 }, { 0x8035, 0x0083 }, { 0x8036, 0x0EA0 },
-+	{ 0x8037, 0x0E20 }, { 0x8038, 0x0004 }, { 0x8039, 0x2069 }, { 0x803A, 0x0084 },
-+	{ 0x803B, 0x2069 }, { 0x803C, 0x0085 }, { 0x803D, 0x0800 }, { 0x803E, 0x2049 },
-+	{ 0x803F, 0x2820 }, { 0x8040, 0x2069 }, { 0x8041, 0x0084 }, { 0x8042, 0x2069 },
-+	{ 0x8043, 0x0085 }, { 0x8044, 0x2069 }, { 0x8045, 0x0080 }, { 0x8046, 0x0000 },
-+	{ 0x8047, 0x0000 }, { 0x8048, 0x2820 }, { 0x8049, 0x00A6 }, { 0x804A, 0x3048 },
-+	{ 0x804B, 0x0081 }, { 0x804C, 0x1B81 }, { 0x804D, 0x284C }, { 0x804E, 0x1F81 },
-+	{ 0x804F, 0x284E }, { 0x8050, 0x3008 }, { 0x8051, 0x0081 }, { 0x8052, 0x3008 },
-+	{ 0x8053, 0x00A8 }, { 0x8054, 0x3000 }, { 0x8055, 0x1BA6 }, { 0x8056, 0x3080 },
-+	{ 0x8057, 0x0081 }, { 0x8058, 0x3840 }, { 0x8059, 0x0081 }, { 0x805A, 0x0DA6 },
-+	{ 0x805B, 0x3200 }, { 0x805C, 0x3200 }, { 0x805D, 0x3200 }, { 0x805E, 0x3200 },
-+	{ 0x805F, 0x39BF }, { 0x8060, 0x0081 }, { 0x8061, 0x3200 }, { 0x8062, 0x3200 },
-+	{ 0x8063, 0x3200 }, { 0x8064, 0x0BA8 }, { 0x8065, 0x2854 }, { 0x8066, 0x3008 },
-+	{ 0x8067, 0x0081 }, { 0x8068, 0x0008 }, { 0x8069, 0x3048 }, { 0x806A, 0x0081 },
-+	{ 0x806B, 0x1B81 }, { 0x806C, 0x286B }, { 0x806D, 0x1F81 }, { 0x806E, 0x286D },
-+	{ 0x806F, 0x3008 }, { 0x8070, 0x0081 }, { 0x8071, 0x3008 }, { 0x8072, 0x00A8 },
-+	{ 0x8073, 0x3048 }, { 0x8074, 0x0081 }, { 0x8075, 0x3200 }, { 0x8076, 0x3200 },
-+	{ 0x8077, 0x3200 }, { 0x8078, 0x3200 }, { 0x8079, 0x3200 }, { 0x807A, 0x3200 },
-+	{ 0x807B, 0x0DA7 }, { 0x807C, 0x1027 }, { 0x807D, 0x1B81 }, { 0x807E, 0x1427 },
-+	{ 0x807F, 0x3008 }, { 0x8080, 0x0081 }, { 0x8081, 0x3200 }, { 0x8082, 0x3200 },
-+	{ 0x8083, 0x3200 }, { 0x8084, 0x0BA8 }, { 0x8085, 0x2873 }, { 0x8086, 0x0827 },
-+	{ 0x8087, 0x0008 },
++	{ 0x801F, 0x0087 }, { 0x8020, 0x2076 }, { 0x8021, 0x3A01 }, { 0x8022, 0x1903 },
++	{ 0x8023, 0x2846 }, { 0x8024, 0x3A03 }, { 0x8025, 0x1903 }, { 0x8026, 0x284D },
++	{ 0x8027, 0x3A01 }, { 0x8028, 0x1903 }, { 0x8029, 0x2837 }, { 0x802A, 0x3A07 },
++	{ 0x802B, 0x1D03 }, { 0x802C, 0x2820 }, { 0x802D, 0x0023 }, { 0x802E, 0x3055 },
++	{ 0x802F, 0x0096 }, { 0x8030, 0x30AA }, { 0x8031, 0x0096 }, { 0x8032, 0x1495 },
++	{ 0x8033, 0x0000 }, { 0x8034, 0x0000 }, { 0x8035, 0x0026 }, { 0x8036, 0x2820 },
++	{ 0x8037, 0x300C }, { 0x8038, 0x0081 }, { 0x8039, 0x0824 }, { 0x803A, 0x0086 },
++	{ 0x803B, 0x0825 }, { 0x803C, 0x0087 }, { 0x803D, 0x0822 }, { 0x803E, 0x0084 },
++	{ 0x803F, 0x0823 }, { 0x8040, 0x0085 }, { 0x8041, 0x0E21 }, { 0x8042, 0x0083 },
++	{ 0x8043, 0x0EA0 }, { 0x8044, 0x0E20 }, { 0x8045, 0x0004 }, { 0x8046, 0x2076 },
++	{ 0x8047, 0x0084 }, { 0x8048, 0x2076 }, { 0x8049, 0x0085 }, { 0x804A, 0x0800 },
++	{ 0x804B, 0x2056 }, { 0x804C, 0x2820 }, { 0x804D, 0x2076 }, { 0x804E, 0x0084 },
++	{ 0x804F, 0x2076 }, { 0x8050, 0x0085 }, { 0x8051, 0x2076 }, { 0x8052, 0x0080 },
++	{ 0x8053, 0x0000 }, { 0x8054, 0x0000 }, { 0x8055, 0x2820 }, { 0x8056, 0x00A6 },
++	{ 0x8057, 0x3048 }, { 0x8058, 0x0081 }, { 0x8059, 0x1B81 }, { 0x805A, 0x2859 },
++	{ 0x805B, 0x1F81 }, { 0x805C, 0x285B }, { 0x805D, 0x3008 }, { 0x805E, 0x0081 },
++	{ 0x805F, 0x3008 }, { 0x8060, 0x00A8 }, { 0x8061, 0x3000 }, { 0x8062, 0x1BA6 },
++	{ 0x8063, 0x3080 }, { 0x8064, 0x0081 }, { 0x8065, 0x3840 }, { 0x8066, 0x0081 },
++	{ 0x8067, 0x0DA6 }, { 0x8068, 0x3200 }, { 0x8069, 0x3200 }, { 0x806A, 0x3200 },
++	{ 0x806B, 0x3200 }, { 0x806C, 0x39BF }, { 0x806D, 0x0081 }, { 0x806E, 0x3200 },
++	{ 0x806F, 0x3200 }, { 0x8070, 0x3200 }, { 0x8071, 0x0BA8 }, { 0x8072, 0x2861 },
++	{ 0x8073, 0x3008 }, { 0x8074, 0x0081 }, { 0x8075, 0x0008 }, { 0x8076, 0x3048 },
++	{ 0x8077, 0x0081 }, { 0x8078, 0x1B81 }, { 0x8079, 0x2878 }, { 0x807A, 0x1F81 },
++	{ 0x807B, 0x287A }, { 0x807C, 0x3008 }, { 0x807D, 0x0081 }, { 0x807E, 0x3008 },
++	{ 0x807F, 0x00A8 }, { 0x8080, 0x3048 }, { 0x8081, 0x0081 }, { 0x8082, 0x3200 },
++	{ 0x8083, 0x3200 }, { 0x8084, 0x3200 }, { 0x8085, 0x3200 }, { 0x8086, 0x3200 },
++	{ 0x8087, 0x3200 }, { 0x8088, 0x0DA7 }, { 0x8089, 0x1027 }, { 0x808A, 0x1B81 },
++	{ 0x808B, 0x1427 }, { 0x808C, 0x3008 }, { 0x808D, 0x0081 }, { 0x808E, 0x3200 },
++	{ 0x808F, 0x3200 }, { 0x8090, 0x3200 }, { 0x8091, 0x0BA8 }, { 0x8092, 0x2880 },
++	{ 0x8093, 0x0827 }, { 0x8094, 0x0008 },
 +};
 +
-+#define PIC16F1_EXEC_WORDS 121
++#define PIC16F1_EXEC_WORDS 134
 +
 +#endif /* OPENOCD_TARGET_PIC16F1_EXEC_H */
 diff --git a/src/target/pic16f1_icsp.c b/src/target/pic16f1_icsp.c
@@ -4021,10 +4777,10 @@ index 0000000..bfd3e08
 +adapter speed 100
 diff --git a/tcl/target/pic16f193x.cfg b/tcl/target/pic16f193x.cfg
 new file mode 100644
-index 0000000..8dba833
+index 0000000..ddd3745
 --- /dev/null
 +++ b/tcl/target/pic16f193x.cfg
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,47 @@
 +# SPDX-License-Identifier: GPL-2.0-or-later
 +
 +#
@@ -4058,9 +4814,10 @@ index 0000000..8dba833
 +flash bank $_CHIPNAME.config pic16f1 0x10000 0 0 0 $_TARGETNAME
 +flash bank $_CHIPNAME.eeprom pic16f1 0x1E000 0 0 0 $_TARGETNAME
 +
-+# Only one hardware breakpoint exists, which halts after the instruction.
-+# Make gdb's software breakpoint requests use it.
-+gdb_breakpoint_override hard
++# A debugger's software breakpoint requests (Z0) become software
++# breakpoints: any number, halting before the instruction, each one a
++# rewrite of a flash row. Hardware breakpoint requests (Z1, "bp <addr> 2 hw")
++# use the one hardware breakpoint, which halts after the instruction.
 +
 +# A register write that fails (the program counter cannot be written) is
 +# reported to the debugger instead of being acknowledged.

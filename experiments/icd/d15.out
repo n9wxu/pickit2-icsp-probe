@@ -1,0 +1,16 @@
+A. write 8 words at 0x0400 (blank row)
+   before: 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF
+   after:  3000 3011 3022 3033 3044 3055 3066 3077 3FFF 3FFF
+   written; EECON1=80
+B. erase the row
+   after:  3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF 3FFF
+   blank (50 ms)
+C. change INCF 0x71,F at 0x0021 to INCF 0x72,F in the running program
+   row 0x20: 0AF0 0AF1 2820 3FFF ...
+   before: counters [95, 95, 0]
+   row 0x20: 0AF0 0AF2 2820 3FFF ...  as written (2.0 s)
+   after:  counters [174, 0, 173], PC=0021
+D. put it back
+   row 0x20 restored
+   counters [138, 138, 0]
+still steps: PC=0022

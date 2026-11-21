@@ -75,12 +75,12 @@ released and the boost converter stopped; target power is left on unless `power_
 
 | Command | Meaning |
 |---|---|
-| `pic16f1 load_debug <file> [type]` | Intel HEX or ELF, detected from the file. What `Debugger.load` does: bulk erase, program flash/EEPROM/user IDs of the image, the debug executive (0x8004, 0x8010-0x8088), configuration words with DEBUG enabled, verify, release reset. The target ends halted at the reset vector. |
+| `pic16f1 load_debug <file> [type]` | Intel HEX or ELF, detected from the file. What `Debugger.load` does: bulk erase, program flash/EEPROM/user IDs of the image, the software breakpoint gadget (two words in each page), the debug executive (0x8004, 0x8010-0x8095), configuration words with DEBUG enabled, verify, release reset. The target ends halted at the reset vector. |
 | `pic16f1 unload_debug` | What `Debugger.unload` does: bulk erase and erase the executive rows 0x8020-0x80FF. The device is blank afterwards (it keeps running, power stays on). |
 
 | `pic16f1 forget_flash` | Drop the program memory read so far in this session. Only needed after the program has written its own flash. |
 
-Standard commands that work: `halt`, `resume`, `step`, `reset halt|run|init`, `reg`, `reg <name> [value]`, `bp <addr> 2 hw`,
+Standard commands that work: `halt`, `resume`, `step`, `reset halt|run|init`, `reg`, `reg <name> [value]`, `bp <addr> 2` (software), `bp <addr> 2 hw`,
 `rbp`, `mdb/mdh/mdw/mwb/...`, `targets`, `poll`, and over gdb-remote the generic register and memory packets.
 
 ### Registers
@@ -117,7 +117,8 @@ too, an `E` reply to `P`). The values are read once on every halt, 27 bytes in o
   (one word per byte). The driver has the part read its own memory through `EEADR`/`EECON1`/`EEDAT` and puts the
   user's values of those registers back. Words read are kept until the part is reprogrammed or contact is lost
   (`pic16f1 forget_flash` drops them). The executive's own words at 0x8010 and up read as zero this way. None of
-  this can be written during a debug session.
+  this can be written during a debug session. Where a software breakpoint is set, the read gives the program's
+  instruction, not the `CALL` that is in flash; the two-word gadget does show (0x0002, 0x0008 at the top of each page).
 - Data memory accesses are one byte per executive command. See "Speed" below.
 
 ### What a debugger sees over gdb-remote
@@ -128,8 +129,9 @@ Checked with raw packets on the PIC16LF1937 (the list the toolchain's LLDB plugi
 
 - Connecting halts the target (`gdb-attach` event in the config file). Probing the flash banks for the memory map
   goes through the debug link when the target is halted, so connecting does not reset it.
-- `Z0` and `Z1` both use the one hardware breakpoint. A second breakpoint gets an `E` reply.
-- A stop is reported with the true pc: after a breakpoint that is the instruction after the breakpoint address.
+- `Z0` sets a software breakpoint and `Z1` the one hardware breakpoint. A second hardware breakpoint gets an `E` reply.
+- A stop at a software breakpoint is reported with pc on the breakpoint. After the hardware breakpoint the pc is the
+  instruction after the breakpoint address.
 - There is no thread list (`qfThreadInfo` answers `l`) and no `qHostInfo`; stop replies are `T05` without a thread.
 
 ### LLDB from the PIC16F1 toolchain
@@ -149,14 +151,17 @@ What worked: connecting, the register display including the compiler's pairs, di
 name and by source line, `continue`, `stepi`, `bt` through inlined frames and a library routine, `frame variable`,
 `target variable`, expressions (`p gain + gain + total`) and assignment (`expr gain = 6`, read back through OpenOCD).
 Run to the last line, `total` read 83, the value the program is written to end with. `bt` inside the recursive
-function lists all five frames.
+function lists all five frames. With software breakpoints: stops are shown as breakpoint hits on the right line,
+`next` and `finish` work while user breakpoints are set, and a breakpoint in a loop was hit eight times with the
+program's result still 83.
 
 What did not, all on the debugger's side and reported to the toolchain project:
 
 - LLDB reads memory in 512-byte lines by default, which made the first disassembly take 14 s at this board's
   500 kHz clock. The toolchain's `pic16f1-lldb` now sets a 32-byte line; a whole session then took 6 s.
-- `next` over a call, with a user breakpoint set, stopped inside the called routine: it needs a second breakpoint.
-- A stop at a breakpoint is shown as `signal SIGTRAP` one instruction on, not as a breakpoint hit.
+- With only the hardware breakpoint (before software breakpoints existed), `next` over a call with a user breakpoint
+  set stopped inside the called routine, and a stop was shown as `signal SIGTRAP` one instruction on.
+- OpenOCD warns that `keep_alive() was not invoked` while a flash row is rewritten. It is harmless.
 
 ### Speed
 
@@ -174,14 +179,30 @@ The link is clocked by the target, so it follows the target's oscillator. Measur
 A program that switches to a faster oscillator shortens the bit times in proportion; an 800 us handshake per byte
 remains, which sets a floor near 3 ms per byte of data memory.
 
-### Breakpoint skid
+### Breakpoints
 
-There is exactly one hardware breakpoint. **The target halts after the instruction at the breakpoint address has executed**,
-so the reported pc is the next instruction to execute (the branch target if the instruction at the address was a jump).
-A breakpoint at the current pc therefore lets one instruction run. Single step uses the same breakpoint, so a step
-temporarily replaces the user breakpoint, which is re-armed at the next `resume`. Only hardware breakpoints are accepted
-(`bp <addr> 2 hw`); the config file sets `gdb_breakpoint_override hard` so that gdb's software breakpoint requests
-use the hardware one. Watchpoints are not available. `resume <address>` and `step <address>` fail, as the pc cannot be changed.
+**Software breakpoints** (`bp <addr> 2`, a debugger's `Z0`): up to 64, and the target halts *before* the instruction,
+with pc on the breakpoint. `docs/icd.md` describes the mechanism: the instruction is replaced in flash by a call to a
+two-word gadget that `load_debug` placed in every page, and the driver does the work of the replaced instruction
+itself when the target goes on.
+
+- Flash is rewritten only when the target is about to run (`resume`), not when a breakpoint is set or removed, and one
+  rewrite covers all changes in a 32-word row. Debuggers remove and re-insert breakpoints around every step; that costs
+  nothing this way. A rewrite takes about 4 s at the 500 kHz reset clock and is one erase cycle of that row.
+- They need the gadget, so the program must have been loaded with `pic16f1 load_debug`, in this OpenOCD process or an
+  earlier one (the gadget is looked for in the top 64 words of the first page). The instructions that breakpoints
+  replaced are known to the process that set them only: if OpenOCD exits with breakpoints in flash, load the program
+  again. A debugger that detaches removes its breakpoints first, and the resume that follows puts flash back.
+- While stopped at one, `stkptr` and `pc` are shown as the program would have them; the gadget's return address sits
+  one level above the top of the return stack, so a breakpoint needs one free level.
+- `RESET`, `SLEEP` and `CLRWDT` cannot take a software breakpoint. Nor can the gadget itself.
+
+**The hardware breakpoint** (`bp <addr> 2 hw`, `Z1`): exactly one. **The target halts after the instruction at the
+breakpoint address has executed**, so the reported pc is the next instruction to execute (the branch target if the
+instruction at the address was a jump). Single step uses the same breakpoint, so a step temporarily replaces the user
+breakpoint, which is re-armed at the next `resume`. It costs no flash write.
+
+Watchpoints are not available. `resume <address>` and `step <address>` fail, as the pc cannot be set.
 
 ### Flash banks
 
@@ -249,8 +270,8 @@ pc (/32): 0x00000ff0
 
 - Only the PIC16(L)F193x are supported for debugging, and only one device, a PIC16LF1937 revision 2, was tried.
   PIC16F1829/1619 are in the table, untried. The 8-bit command generation (PIC16F1xxxx) is not supported.
-- One hardware breakpoint; it halts after the instruction. No software breakpoints (the pc cannot be changed, so they
-  cannot be made transparent), no watchpoints.
+- One hardware breakpoint; it halts after the instruction. Software breakpoints rewrite flash (see "Breakpoints").
+  No watchpoints.
 - The pc cannot be written. `resume`/`step` at an address fail.
 - Program memory is read-only while debugging, and slow to read at a low target clock (see "Speed").
 - ELF input to `load_debug` was tried with one file from the PIC16F1 toolchain. Data whose load address is in

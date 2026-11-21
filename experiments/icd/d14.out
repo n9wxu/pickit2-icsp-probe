@@ -1,0 +1,33 @@
+start: PC=0001 STKPTR=1F
+1. site 1, no stack edit (an instruction without a jump)
+   halt PC=07F1 STKPTR=00 TOS=0023 PCLATH=00  as expected
+   ran: laps+1
+2. site 2, push sub (CALL sub)
+   halt PC=07F1 STKPTR=00 TOS=0026 PCLATH=00  as expected
+   ran: S1+1+1, S1+2+1
+3. site 3 inside sub2, pop (RETURN)
+   halt PC=07F1 STKPTR=01 TOS=0082 PCLATH=00  as expected
+   ran: S2+1+1, sub2+1, sub+1
+4. site 4 in page 1 with PCLATH=08, TOS = m (GOTO m)
+   halt PC=0FF1 STKPTR=00 TOS=0902 PCLATH=08  as expected
+   ran: ret2+1, page1+1
+5. site 1 again, reached with PCLATH from page 1?  TOS = site + 2 (a skip taken)
+   halt PC=07F1 STKPTR=00 TOS=0023 PCLATH=00  as expected
+   ran: laps+1
+6. site 2, plain; then on to site 3, pop; site 4, TOS = m
+   halt PC=07F1 STKPTR=00 TOS=0026 PCLATH=00  as expected
+   ran: S1+2+1
+   halt PC=07F1 STKPTR=01 TOS=0082 PCLATH=00  as expected
+   ran: S2+1+1, sub2+1
+   halt PC=0FF1 STKPTR=00 TOS=0902 PCLATH=08  as expected
+   ran: ret2+1, page1+1
+7. site 1, TOS = t1 (GOTO t1), then single step the RETURN instead of running
+   halt PC=07F1 STKPTR=00 TOS=0023 PCLATH=00  as expected
+   ran: laps+1
+   after one step: PC=0060 (t1 is 0060) STKPTR=1F
+   ran: nothing
+   after another:  PC=0061
+   ran: t1+1
+   halt PC=07F1 STKPTR=00 TOS=0026 PCLATH=00  as expected
+   ran: nothing
+final STKPTR=00
